@@ -1,0 +1,142 @@
+import base64
+import tempfile
+import unittest
+from pathlib import Path
+
+from core.gitee_client import GiteeAIClient, GiteeAPIError
+from core.prompting import build_selfie_prompt, split_size_suffix
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, content=b"", headers=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.content = content
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+
+class FakeHTTPClient:
+    def __init__(self, responses, download=None):
+        self.responses = list(responses)
+        self.download = download
+        self.requests = []
+
+    async def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        return self.responses.pop(0)
+
+    async def get(self, url, **kwargs):
+        self.requests.append(("GET", url, kwargs))
+        if self.download is not None:
+            return self.download
+        return self.responses.pop(0)
+
+
+class PromptingTest(unittest.TestCase):
+    def test_ratio_suffix_uses_gitee_whitelist_size(self):
+        prompt, size = split_size_suffix("阳台下午茶 16:9", "1024x1024")
+        self.assertEqual(prompt, "阳台下午茶")
+        self.assertEqual(size, "1024x576")
+
+    def test_ratio_suffix_maps_all_gitee_landscape_sizes(self):
+        self.assertEqual(split_size_suffix("测试 4:3", "1024x1024")[1], "1152x896")
+        self.assertEqual(split_size_suffix("测试 3:2", "1024x1024")[1], "2048x1360")
+
+    def test_selfie_prompt_keeps_user_request_above_life_defaults(self):
+        result = build_selfie_prompt(
+            "用户要求红色雨衣，不要裙子",
+            {
+                "outfit": "蓝色学院风裙装",
+                "schedule": "下午在咖啡店阅读",
+                "timeline": [{"time": "15:00", "activity": "阅读"}],
+            },
+            "保持参考图人物身份一致",
+        )
+        self.assertIn("红色雨衣，不要裙子", result)
+        self.assertIn("蓝色学院风裙装", result)
+        self.assertIn("15:00 阅读", result)
+        self.assertIn("用户要求（最高优先级）", result)
+
+
+class GiteeClientTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = {
+            "api_base_url": "https://example.test/v1",
+            "api_keys": ["key-a", "key-b"],
+            "model": "z-image-turbo",
+            "default_size": "1024x1024",
+            "num_inference_steps": 9,
+            "poll_interval": 0,
+            "poll_timeout": 2,
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_generate_decodes_base64_and_rotates_key(self):
+        image = b"\x89PNG\r\nimage"
+        fake = FakeHTTPClient(
+            [FakeResponse(payload={"data": [{"b64_json": base64.b64encode(image).decode()}]})]
+        )
+        client = GiteeAIClient(self.config, Path(self.tmp.name), http_client=fake)
+
+        result = await client.generate("一只猫", size="1024x1024")
+
+        self.assertEqual(result.read_bytes(), image)
+        self.assertEqual(result.suffix, ".png")
+        self.assertEqual(fake.requests[0][0:2], ("POST", "https://example.test/v1/images/generations"))
+        self.assertEqual(fake.requests[0][2]["headers"]["Authorization"], "Bearer key-a")
+        self.assertEqual(fake.requests[0][2]["json"]["prompt"], "一只猫")
+
+    async def test_base_url_without_v1_is_normalized(self):
+        client = GiteeAIClient(
+            {**self.config, "api_base_url": "https://example.test"},
+            Path(self.tmp.name),
+            http_client=FakeHTTPClient(
+                [FakeResponse(payload={"data": [{"b64_json": base64.b64encode(b"jpg").decode()}]})]
+            ),
+        )
+        await client.generate("测试")
+        self.assertEqual(client._base_url(), "https://example.test/v1")
+
+    async def test_edit_polls_until_success_and_downloads_url(self):
+        image = b"\xff\xd8\xffjpeg"
+        fake = FakeHTTPClient(
+            [
+                FakeResponse(payload={"task_id": "task-1"}),
+                FakeResponse(payload={"status": "processing"}),
+                FakeResponse(payload={"status": "success", "output": {"file_url": "https://cdn.test/a.jpg"}}),
+            ],
+            download=FakeResponse(content=image, headers={"content-type": "image/jpeg"}),
+        )
+        client = GiteeAIClient(self.config, Path(self.tmp.name), http_client=fake)
+
+        result = await client.edit("换成晴天", [image], task_types=["id"])
+
+        self.assertEqual(result.read_bytes(), image)
+        self.assertEqual(result.suffix, ".jpg")
+        data = fake.requests[0][2]["data"]
+        self.assertIn(("task_types", "id"), data)
+        self.assertNotIn(("task_types", "invalid"), data)
+        self.assertEqual(len(fake.requests), 4)
+        self.assertNotIn("Authorization", fake.requests[-1][2].get("headers", {}))
+
+    async def test_http_error_is_user_safe(self):
+        fake = FakeHTTPClient([FakeResponse(401, {"message": "invalid token"})])
+        client = GiteeAIClient(self.config, Path(self.tmp.name), http_client=fake)
+
+        with self.assertRaisesRegex(GiteeAPIError, "invalid token"):
+            await client.generate("测试")
+
+    async def test_missing_key_fails_before_network_request(self):
+        fake = FakeHTTPClient([])
+        config = {**self.config, "api_keys": []}
+        client = GiteeAIClient(config, Path(self.tmp.name), http_client=fake)
+
+        with self.assertRaisesRegex(GiteeAPIError, "API Key"):
+            await client.generate("测试")
+        self.assertEqual(fake.requests, [])

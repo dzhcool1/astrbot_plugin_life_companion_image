@@ -1,0 +1,7 @@
+name: astrbot_plugin_life_companion_image
+display_name: Life Companion Image 生活伙伴生图
+desc: "接入 Gitee AI Images 的独立生图插件：文生图、生活自拍、改图和参考照管理；会读取 astrbot_plugin_life_companion 的今日日程、穿搭与生活照提示词。"
+version: v1.0.0
+author: dzhcool1
+astrbot_version: ">=4.16.0,<5"
+repo: "https://github.com/dzhcool1/astrbot_plugin_life_companion_image"

@@ -1,0 +1,96 @@
+{
+  "api_base_url": {
+    "description": "Gitee AI API Base URL",
+    "hint": "默认使用 https://ai.gitee.com/v1；一般不要填写 /images/generations 具体路径。",
+    "type": "string",
+    "default": "https://ai.gitee.com/v1"
+  },
+  "api_keys": {
+    "description": "Gitee AI API Key 池",
+    "hint": "支持填写多个 Key，插件会轮询使用。",
+    "type": "list",
+    "default": [],
+    "obvious_hint": true
+  },
+  "model": {
+    "description": "Gitee AI 文生图模型",
+    "type": "string",
+    "default": "z-image-turbo"
+  },
+  "default_size": {
+    "description": "默认输出尺寸",
+    "hint": "Gitee 白名单尺寸，例如 1024x1024、1024x576、768x1024。命令末尾也可临时写 1:1、16:9 等比例。",
+    "type": "string",
+    "default": "1024x1024"
+  },
+  "num_inference_steps": {
+    "description": "文生图推理步数",
+    "type": "int",
+    "slider": {"min": 1, "max": 30, "step": 1},
+    "default": 9
+  },
+  "negative_prompt": {
+    "description": "文生图负面提示词",
+    "type": "text",
+    "default": ""
+  },
+  "edit_model": {
+    "description": "改图/自拍模型",
+    "type": "string",
+    "default": "Qwen-Image-Edit-2511"
+  },
+  "edit_num_inference_steps": {
+    "description": "改图推理步数",
+    "type": "int",
+    "slider": {"min": 1, "max": 30, "step": 1},
+    "default": 4
+  },
+  "guidance_scale": {
+    "description": "改图 guidance scale",
+    "type": "float",
+    "default": 1.0
+  },
+  "task_types": {
+    "description": "改图任务类型",
+    "hint": "常用 id；也可使用 style、background、subject、element。",
+    "type": "list",
+    "default": ["id"]
+  },
+  "poll_interval": {
+    "description": "异步改图轮询间隔（秒）",
+    "type": "int",
+    "default": 5
+  },
+  "poll_timeout": {
+    "description": "异步改图超时（秒）",
+    "type": "int",
+    "default": 300
+  },
+  "timeout": {
+    "description": "HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "max_image_bytes": {
+    "description": "单张结果图片大小上限（字节）",
+    "type": "int",
+    "default": 20971520
+  },
+  "use_life_companion": {
+    "description": "读取 Life Companion 今日日程",
+    "type": "bool",
+    "default": true
+  },
+  "reference_images": {
+    "description": "自拍参考照（建议用命令设置）",
+    "hint": "发送图片后使用 /生活参考照 设置；此处保存的是插件数据目录内的相对路径。",
+    "type": "file",
+    "default": [],
+    "file_types": ["jpg", "jpeg", "png", "webp"]
+  },
+  "selfie_prompt_prefix": {
+    "description": "自拍固定提示词前缀",
+    "type": "text",
+    "default": "请根据参考图生成一张自然真实的人像照片。保持第1张参考图的人脸身份和气质一致；其它参考图只用于服装、姿势、构图或场景参考；不要拼图、不要水印、不要文字，不要无故增加手机、相机或拍摄界面。"
+  }
+}
