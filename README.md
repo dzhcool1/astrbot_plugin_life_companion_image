@@ -2,6 +2,8 @@
 
 一个与 `astrbot_plugin_gitee_aiimg` 使用方式相近、但可以独立安装的 AstrBot 生图插件。它直接调用 Gitee AI Images API，并和 `astrbot_plugin_life_companion` 共享每日穿搭、日程、时间线及生活照提示词。
 
+更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 功能
 
 - Gitee AI 文生图：`/生活照 <提示词>`，支持命令末尾追加 `1:1`、`16:9`、`9:16` 等比例。
