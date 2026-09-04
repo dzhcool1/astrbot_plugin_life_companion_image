@@ -37,6 +37,9 @@ def _install_astrbot_stubs():
             pass
 
     class _Filter:
+        class PermissionType:
+            ADMIN = "admin"
+
         @staticmethod
         def _identity(*args, **kwargs):
             def decorate(func):
@@ -46,6 +49,7 @@ def _install_astrbot_stubs():
 
         command = _identity
         llm_tool = _identity
+        permission_type = _identity
 
     class _Image:
         def __init__(self, encoded=""):
@@ -144,6 +148,33 @@ class _SendEvent:
 
 
 class PluginContextTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _provider_plugin():
+        plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
+        plugin.config = {
+            "features": {
+                "draw": {"chain": [{"provider_id": "old"}, {"provider_id": "backup"}]},
+                "selfie": {"chain": [{"provider_id": "old"}]},
+                "edit": {"chain": [{"provider_id": "old"}]},
+            },
+            "providers": [
+                {
+                    "id": "old",
+                    "label": "旧服务",
+                    "__template_key": "gemini_native",
+                    "model": "same-model",
+                },
+                {
+                    "id": "new",
+                    "label": "新服务",
+                    "__template_key": "gemini_native",
+                    "model": "same-model",
+                },
+            ],
+        }
+        plugin._send_text = AsyncMock()
+        return plugin
+
     async def test_legacy_aiimg_tool_alias_preserves_old_modes(self):
         plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
         plugin._draw = AsyncMock()
@@ -233,3 +264,71 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
         plugin._send_image.assert_awaited_once_with(
             event, Path("/tmp/generated-test.jpg")
         )
+
+    async def test_image_models_lists_provider_names_and_models(self):
+        plugin = self._provider_plugin()
+
+        await plugin.image_models(types.SimpleNamespace(message_str="/生图模型"))
+
+        text = plugin._send_text.await_args.args[1]
+        self.assertIn("旧服务（old）：same-model", text)
+        self.assertIn("新服务（new）：same-model", text)
+        self.assertIn("当前首选服务商", text)
+
+    async def test_switch_all_uses_provider_name_and_keeps_fallbacks(self):
+        plugin = self._provider_plugin()
+
+        await plugin.switch_image_provider(
+            types.SimpleNamespace(message_str="/切换生图 新服务")
+        )
+
+        self.assertEqual(
+            plugin.config["features"]["draw"]["chain"],
+            [{"provider_id": "new"}, {"provider_id": "old"}, {"provider_id": "backup"}],
+        )
+        self.assertEqual(
+            plugin.config["features"]["selfie"]["chain"], [{"provider_id": "new"}, {"provider_id": "old"}]
+        )
+        self.assertEqual(
+            plugin.config["features"]["edit"]["chain"], [{"provider_id": "new"}, {"provider_id": "old"}]
+        )
+        self.assertIn("文生图、自拍、改图", plugin._send_text.await_args.args[1])
+
+    async def test_switch_single_operation_changes_only_requested_chain(self):
+        plugin = self._provider_plugin()
+
+        await plugin.switch_image_provider(
+            types.SimpleNamespace(message_str="/切换生图 文生图 新服务")
+        )
+
+        self.assertEqual(plugin.config["features"]["draw"]["chain"][0], {"provider_id": "new"})
+        self.assertEqual(plugin.config["features"]["selfie"]["chain"][0], {"provider_id": "old"})
+        self.assertEqual(plugin.config["features"]["edit"]["chain"][0], {"provider_id": "old"})
+
+    async def test_switch_rejects_unsupported_provider_without_partial_change(self):
+        plugin = self._provider_plugin()
+        plugin.config["providers"].append(
+            {
+                "id": "draw-only",
+                "label": "仅文生图",
+                "__template_key": "gitee_images",
+                "model": "draw-model",
+            }
+        )
+
+        await plugin.switch_image_provider(
+            types.SimpleNamespace(message_str="/切换生图 仅文生图")
+        )
+
+        self.assertEqual(plugin.config["features"]["draw"]["chain"][0], {"provider_id": "old"})
+        self.assertIn("不支持", plugin._send_text.await_args.args[1])
+
+    async def test_switch_does_not_treat_model_name_as_provider_name(self):
+        plugin = self._provider_plugin()
+
+        await plugin.switch_image_provider(
+            types.SimpleNamespace(message_str="/切换生图 same-model")
+        )
+
+        self.assertEqual(plugin.config["features"]["draw"]["chain"][0], {"provider_id": "old"})
+        self.assertIn("没有找到服务商", plugin._send_text.await_args.args[1])

@@ -33,6 +33,26 @@ class LifeCompanionImagePlugin(Star):
         "astrbot_plugin_life_companion",
         "astrbot_plugin_life_scheduler",
     )
+    _IMAGE_OPERATION_LABELS = {
+        "draw": "文生图",
+        "selfie": "自拍",
+        "edit": "改图",
+    }
+    _IMAGE_OPERATION_ALIASES = {
+        "文生图": "draw",
+        "生活照": "draw",
+        "draw": "draw",
+        "自拍": "selfie",
+        "生活自拍": "selfie",
+        "selfie": "selfie",
+        "改图": "edit",
+        "图生图": "edit",
+        "生活改图": "edit",
+        "edit": "edit",
+        "全部": "all",
+        "所有": "all",
+        "all": "all",
+    }
 
     def __init__(self, context: Context, config: dict[str, Any]):
         super().__init__(context)
@@ -266,6 +286,163 @@ class LifeCompanionImagePlugin(Star):
         if isinstance(value, list):
             return [str(item) for item in value]
         return None
+
+    def _configured_providers(self) -> list[dict[str, Any]]:
+        providers = self.config.get("providers")
+        if not isinstance(providers, list):
+            return []
+        return [
+            provider
+            for provider in providers
+            if isinstance(provider, dict) and str(provider.get("id") or "").strip()
+        ]
+
+    @staticmethod
+    def _provider_display_name(provider: dict[str, Any]) -> str:
+        provider_id = str(provider.get("id") or "").strip()
+        label = str(provider.get("label") or "").strip()
+        if label and label.casefold() != provider_id.casefold():
+            return f"{label}（{provider_id}）"
+        return label or provider_id
+
+    @staticmethod
+    def _provider_match_names(provider: dict[str, Any]) -> set[str]:
+        return {
+            str(provider.get(key) or "").strip().casefold()
+            for key in ("id", "label")
+            if str(provider.get(key) or "").strip()
+        }
+
+    @staticmethod
+    def _provider_capabilities(provider: dict[str, Any]) -> set[str]:
+        template = GiteeAIClient._provider_template(provider)
+        capabilities = {
+            "gemini_native": {"draw", "selfie", "edit"},
+            "gitee_images": {"draw"},
+            "gitee_async": {"selfie", "edit"},
+            "openai_images": {"draw", "selfie", "edit"},
+            "gemini_openai_images": {"draw", "selfie", "edit"},
+        }.get(template, set())
+        if "supports_edit" in provider and not LifeCompanionImagePlugin._bool_config_value(
+            provider.get("supports_edit"), True
+        ):
+            capabilities = capabilities - {"selfie", "edit"}
+        return capabilities
+
+    def _provider_for_id(self, provider_id: str) -> dict[str, Any] | None:
+        for provider in self._configured_providers():
+            if str(provider.get("id") or "").strip() == provider_id:
+                return provider
+        return None
+
+    def _find_provider(
+        self, query: str
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        normalized = " ".join(str(query or "").split()).casefold()
+        if not normalized:
+            return None, []
+        matches = [
+            provider
+            for provider in self._configured_providers()
+            if normalized in self._provider_match_names(provider)
+        ]
+        return (matches[0] if len(matches) == 1 else None), matches
+
+    def _chain_provider_ids(self, operation: str) -> list[str]:
+        features = self.config.get("features")
+        section = features.get(operation) if isinstance(features, dict) else {}
+        chain = section.get("chain") if isinstance(section, dict) else []
+        if not isinstance(chain, list):
+            return []
+        result = []
+        for item in chain:
+            parsed = GiteeAIClient._chain_provider_id(item)
+            if parsed:
+                result.append(parsed[0])
+        return result
+
+    def _current_provider_id(self, operation: str) -> str:
+        provider_ids = self._chain_provider_ids(operation)
+        if provider_ids:
+            return provider_ids[0]
+        if operation == "selfie":
+            features = self.config.get("features")
+            selfie = features.get("selfie", {}) if isinstance(features, dict) else {}
+            if isinstance(selfie, dict) and self._bool_config_value(
+                selfie.get("use_edit_chain_when_empty"), True
+            ):
+                return (self._chain_provider_ids("edit") or [""])[0]
+        return ""
+
+    def _format_provider_ref(self, provider_id: str) -> str:
+        provider = self._provider_for_id(provider_id)
+        return self._provider_display_name(provider) if provider else provider_id or "未配置"
+
+    def _provider_list_text(self) -> str:
+        providers = self._configured_providers()
+        if not providers:
+            return "当前没有配置 providers 服务商，请先在插件配置中添加服务商。"
+
+        lines = ["当前已配置的生图服务商和模型："]
+        for provider in providers:
+            model = str(provider.get("model") or "").strip() or "未填写模型"
+            supported = [
+                self._IMAGE_OPERATION_LABELS[operation]
+                for operation in ("draw", "selfie", "edit")
+                if operation in self._provider_capabilities(provider)
+            ]
+            support_text = "、".join(supported) or "当前客户端不支持"
+            lines.append(
+                f"- {self._provider_display_name(provider)}：{model}（支持：{support_text}）"
+            )
+
+        lines.append("")
+        lines.append("当前首选服务商：")
+        for operation, label in self._IMAGE_OPERATION_LABELS.items():
+            lines.append(f"- {label}：{self._format_provider_ref(self._current_provider_id(operation))}")
+        lines.extend(
+            [
+                "",
+                "切换用法：",
+                "/切换生图 服务商名称（切换文生图、自拍、改图）",
+                "/切换生图 自拍 服务商名称",
+                "/切换生图 文生图 服务商名称",
+                "/切换生图 改图 服务商名称",
+            ]
+        )
+        return "\n".join(lines)
+
+    @classmethod
+    def _parse_switch_request(cls, raw: str) -> tuple[str, str]:
+        value = " ".join(str(raw or "").split())
+        if not value:
+            return "", ""
+        first, separator, remainder = value.partition(" ")
+        operation = cls._IMAGE_OPERATION_ALIASES.get(first.casefold(), "all")
+        if not separator:
+            return operation, "" if operation != "all" else value
+        return operation, remainder.strip()
+
+    def _move_provider_to_front(self, operation: str, provider_id: str) -> None:
+        features = self.config.get("features")
+        if not isinstance(features, dict):
+            raise GiteeAPIError("插件配置缺少 features，无法切换服务商")
+        section = features.get(operation)
+        if not isinstance(section, dict):
+            section = {}
+            features[operation] = section
+        raw_chain = section.get("chain")
+        chain = list(raw_chain) if isinstance(raw_chain, list) else []
+        selected = None
+        fallback = []
+        for item in chain:
+            parsed = GiteeAIClient._chain_provider_id(item)
+            if parsed and parsed[0] == provider_id:
+                if selected is None:
+                    selected = item
+                continue
+            fallback.append(item)
+        section["chain"] = [selected or {"provider_id": provider_id}, *fallback]
 
     async def _reference_images(self, event: AstrMessageEvent) -> list[bytes]:
         configured = self._configured_reference_paths()
@@ -568,6 +745,71 @@ class LifeCompanionImagePlugin(Star):
                 operation="edit",
             ),
         )
+
+    @filter.command("生图模型", alias={"image models"})
+    async def image_models(self, event: AstrMessageEvent):
+        await self._send_text(event, self._provider_list_text())
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("切换生图", alias={"switch image"})
+    async def switch_image_provider(self, event: AstrMessageEvent):
+        operation, provider_query = self._parse_switch_request(
+            self._raw_arg(event, ("切换生图", "switch image"))
+        )
+        if not operation or not provider_query:
+            await self._send_text(
+                event,
+                "用法：/切换生图 服务商名称；或 /切换生图 自拍/文生图/改图 服务商名称。"
+                "先使用 /生图模型 查看服务商名称和模型。",
+            )
+            return
+
+        provider, matches = self._find_provider(provider_query)
+        if not provider:
+            if len(matches) > 1:
+                names = "、".join(self._provider_display_name(item) for item in matches)
+                await self._send_text(
+                    event,
+                    f"服务商名称“{provider_query}”对应多个配置：{names}，请使用唯一的服务商 ID。",
+                )
+            else:
+                available = "、".join(
+                    self._provider_display_name(item)
+                    for item in self._configured_providers()
+                )
+                await self._send_text(
+                    event,
+                    f"没有找到服务商“{provider_query}”。当前可用服务商：{available or '无'}。",
+                )
+            return
+
+        operations = (
+            tuple(self._IMAGE_OPERATION_LABELS)
+            if operation == "all"
+            else (operation,)
+        )
+        unsupported = [
+            self._IMAGE_OPERATION_LABELS[item]
+            for item in operations
+            if item not in self._provider_capabilities(provider)
+        ]
+        if unsupported:
+            await self._send_text(
+                event,
+                f"服务商 {self._provider_display_name(provider)} 不支持：{'、'.join(unsupported)}，本次未切换。",
+            )
+            return
+
+        for item in operations:
+            self._move_provider_to_front(item, str(provider["id"]).strip())
+        self._save_config()
+        target = self._provider_display_name(provider)
+        model = str(provider.get("model") or "").strip() or "未填写模型"
+        if operation == "all":
+            message = f"已将文生图、自拍、改图的首选服务商切换为 {target}（模型：{model}）。原有服务商已保留为兜底。"
+        else:
+            message = f"已将{self._IMAGE_OPERATION_LABELS[operation]}的首选服务商切换为 {target}（模型：{model}）。原有服务商已保留为兜底。"
+        await self._send_text(event, message)
 
     @filter.command("生活照", alias={"life image", "生活生图"})
     async def life_image(self, event: AstrMessageEvent):
