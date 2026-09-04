@@ -60,6 +60,31 @@ class PromptingTest(unittest.TestCase):
         self.assertIn("15:00 阅读", result)
         self.assertIn("用户要求（最高优先级）", result)
 
+    def test_selfie_prompt_excludes_capture_devices_from_all_prompt_sources(self):
+        result = build_selfie_prompt(
+            "",
+            {
+                "outfit": "白衬衫，手持智能手机",
+                "schedule": "用相机记录街景",
+                "timeline": [
+                    {"time": "12:00", "activity": "看着手机屏幕"},
+                ],
+                "image_prompt": "自然自拍",
+            },
+            "固定手机入镜",
+        )
+
+        prompt_without_policy = result.split("\n\n拍摄方式规则", 1)[0]
+        for device in ("手机", "相机", "摄像头", "自拍杆", "屏幕"):
+            self.assertNotIn(device, prompt_without_policy)
+        self.assertIn("用户要求（最高优先级）：由他人拍摄的生活照", prompt_without_policy)
+
+        explicit = build_selfie_prompt("对镜自拍，手机自然入镜", {}, "")
+        self.assertIn("用户要求（最高优先级）：由他人拍摄的生活照，自然入镜", explicit)
+        self.assertNotIn("手机自然入镜", explicit)
+        self.assertIn("由他人从画面外拍摄的自然生活照，而不是自拍", explicit)
+        self.assertIn("不做伸手举手机、对镜看屏幕或持拍摄设备的动作", explicit)
+
 
 class GiteeClientTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
