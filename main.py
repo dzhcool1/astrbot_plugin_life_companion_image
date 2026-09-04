@@ -171,6 +171,16 @@ class LifeCompanionImagePlugin(Star):
         return raw.split(maxsplit=1)[1].strip() if " " in raw else ""
 
     @staticmethod
+    def _is_selfie_request(value: Any) -> bool:
+        return bool(
+            re.search(
+                r"自拍|selfie|看看你|发张你|你的照片",
+                str(value or ""),
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
     def _decode_image_data(value: str | bytes) -> bytes:
         if isinstance(value, bytes):
             return value
@@ -433,12 +443,18 @@ class LifeCompanionImagePlugin(Star):
             features[operation] = section
         raw_chain = section.get("chain")
         chain = list(raw_chain) if isinstance(raw_chain, list) else []
+        current_provider_id = ""
+        for item in chain:
+            parsed = GiteeAIClient._chain_provider_id(item)
+            if parsed:
+                current_provider_id = parsed[0]
+                break
         selected = None
         fallback = []
         for item in chain:
             parsed = GiteeAIClient._chain_provider_id(item)
-            if parsed and parsed[0] == provider_id:
-                if selected is None:
+            if parsed and parsed[0] in {provider_id, current_provider_id}:
+                if parsed[0] == provider_id and selected is None:
                     selected = item
                 continue
             fallback.append(item)
@@ -809,9 +825,9 @@ class LifeCompanionImagePlugin(Star):
         target = self._provider_display_name(provider)
         model = str(provider.get("model") or "").strip() or "未填写模型"
         if operation == "all":
-            message = f"已将文生图、自拍、改图的首选服务商切换为 {target}（模型：{model}）。原有服务商已保留为兜底。"
+            message = f"已将文生图、自拍、改图的首选服务商替换为 {target}（模型：{model}）。原首选服务商已从链路移除。"
         else:
-            message = f"已将{self._IMAGE_OPERATION_LABELS[operation]}的首选服务商切换为 {target}（模型：{model}）。原有服务商已保留为兜底。"
+            message = f"已将{self._IMAGE_OPERATION_LABELS[operation]}的首选服务商替换为 {target}（模型：{model}）。原首选服务商已从链路移除。"
         await self._send_text(event, message)
 
     @filter.command("生活照", alias={"life image", "生活生图"})
@@ -882,13 +898,22 @@ class LifeCompanionImagePlugin(Star):
         self,
         event: AstrMessageEvent,
         prompt: str = "",
-        mode: str = "life_photo",
+        mode: str = "auto",
         size: str = "",
     ) -> str:
         """Generate a life-context image and send it to the current conversation."""
         raw_prompt = f"{prompt} {size}".strip()
-        if mode.strip().lower() in {"selfie", "life_selfie", "selfie_ref"}:
+        normalized_mode = str(mode or "auto").strip().lower()
+        if normalized_mode in {"selfie", "life_selfie", "selfie_ref"}:
             await self._selfie(event, raw_prompt)
+        elif normalized_mode in {"edit", "img2img", "aiedit"}:
+            await self._edit(event, raw_prompt)
+        elif normalized_mode == "auto" and self._is_selfie_request(
+            getattr(event, "message_str", "")
+        ):
+            await self._selfie(event, raw_prompt)
+        elif normalized_mode == "auto" and await self._event_images(event):
+            await self._edit(event, raw_prompt)
         else:
             await self._draw(event, raw_prompt)
         return "图片生成任务已执行；如果图片没有出现，请检查插件配置和日志。"
@@ -925,7 +950,7 @@ class LifeCompanionImagePlugin(Star):
         elif normalized_mode in {"edit", "img2img", "aiedit"}:
             await self._edit(event, raw_prompt)
         elif normalized_mode == "auto":
-            if re.search(r"自拍|selfie|看看你|发张你|你的照片", raw_prompt, re.IGNORECASE):
+            if self._is_selfie_request(raw_prompt):
                 await self._selfie(event, raw_prompt)
             elif await self._event_images(event):
                 await self._edit(event, raw_prompt)

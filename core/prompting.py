@@ -13,8 +13,27 @@ RATIO_SIZES = {
     "3:2": "2048x1360",
     "2:3": "1360x2048",
 }
+_RESOLUTION_SQUARE_SIZES = {
+    "1k": "1024x1024",
+    "2k": "2048x2048",
+    "4k": "4096x4096",
+}
+_RATIO_RESOLUTION_SIZES = {
+    ("16:9", "2k"): "2048x1152",
+    ("16:9", "4k"): "4096x2304",
+    ("9:16", "2k"): "1152x2048",
+    ("9:16", "4k"): "2304x4096",
+    ("4:3", "2k"): "2048x1536",
+    ("4:3", "4k"): "4096x3072",
+    ("3:4", "2k"): "1536x2048",
+    ("3:4", "4k"): "3072x4096",
+    ("3:2", "2k"): "2048x1360",
+    ("3:2", "4k"): "4096x2720",
+    ("2:3", "2k"): "1360x2048",
+    ("2:3", "4k"): "2720x4096",
+}
 _SIZE_SUFFIX_RE = re.compile(
-    r"(?:^|\s)(?P<size>(?:\d{3,5}x\d{3,5}|(?:16|9|4|3|2|1):(?:16|9|4|3|2|1)))$",
+    r"(?:^|\s)(?P<size>(?:\d{3,5}[x×]\d{3,5}|\d{1,2}:\d{1,2}(?:\s+(?:1|2|4)k)?|(?:1|2|4)k))$",
     re.IGNORECASE,
 )
 _CAPTURE_DEVICE_RE = re.compile(
@@ -41,14 +60,51 @@ def _sanitize_selfie_text(value: object) -> str:
     return text.strip(" \t,，、;；")
 
 
+def normalize_output_size(value: str, fallback: str = "1024x1024") -> str:
+    """Convert UI size values into the WIDTHxHEIGHT/auto form accepted by image APIs."""
+    normalized = " ".join(str(value or "").strip().lower().split()).replace("×", "x")
+    if normalized == "auto":
+        return "auto"
+
+    dimension = re.fullmatch(r"(\d{3,5})x(\d{3,5})", normalized)
+    if dimension:
+        return f"{dimension.group(1)}x{dimension.group(2)}"
+
+    tokens = re.split(r"[\s,/]+", normalized)
+    ratio = next((token for token in tokens if re.fullmatch(r"\d{1,2}:\d{1,2}", token)), "")
+    resolution = next((token for token in tokens if token in _RESOLUTION_SQUARE_SIZES), "")
+    if ratio:
+        if not resolution:
+            return RATIO_SIZES.get(ratio, fallback or "1024x1024")
+        if resolution == "1k":
+            return RATIO_SIZES.get(ratio, fallback or "1024x1024")
+        mapped = _RATIO_RESOLUTION_SIZES.get((ratio, resolution))
+        if mapped:
+            return mapped
+        try:
+            ratio_width, ratio_height = (int(part) for part in ratio.split(":"))
+            long_side = int(resolution[:-1]) * 1024
+            if ratio_width >= ratio_height:
+                return f"{long_side}x{round(long_side * ratio_height / ratio_width)}"
+            return f"{round(long_side * ratio_width / ratio_height)}x{long_side}"
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    if resolution:
+        return _RESOLUTION_SQUARE_SIZES[resolution]
+
+    fallback_value = str(fallback or "").strip()
+    if fallback_value and fallback_value != value:
+        return normalize_output_size(fallback_value, "1024x1024")
+    return "1024x1024"
+
+
 def split_size_suffix(text: str, default_size: str) -> tuple[str, str]:
     """Allow the familiar ``/aiimg prompt 16:9`` command form."""
     value = str(text or "").strip()
     match = _SIZE_SUFFIX_RE.search(value)
     if not match:
-        return value, str(default_size or "1024x1024")
-    size = match.group("size").lower()
-    normalized = RATIO_SIZES.get(size, size)
+        return value, normalize_output_size(default_size)
+    normalized = normalize_output_size(match.group("size"))
     prompt = value[: match.start()].strip()
     return prompt, normalized
 

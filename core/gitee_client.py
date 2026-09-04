@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import logging
 import re
 import time
 import uuid
@@ -11,6 +12,13 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+from .prompting import normalize_output_size
+
+try:
+    from astrbot.api import logger
+except ModuleNotFoundError:
+    logger = logging.getLogger("astrbot_plugin_life_companion_image")
 
 
 class GiteeAPIError(RuntimeError):
@@ -156,6 +164,15 @@ class GiteeAIClient:
                 f"未配置 {operation} 服务商链路，请在 features.{operation}.chain 中添加 provider"
             )
         return candidates
+
+    @staticmethod
+    def _provider_summary(candidate: dict[str, Any]) -> str:
+        provider = candidate.get("config")
+        model = provider.get("model") if isinstance(provider, dict) else ""
+        return (
+            f"{candidate.get('id', 'unknown')}"
+            f"（模型：{str(model or '未填写').strip()}，类型：{candidate.get('template', 'unknown')}）"
+        )
 
     def _provider_keys(self, provider: dict[str, Any]) -> list[str]:
         return self._parse_keys(provider.get("api_keys") or provider.get("api_key"))
@@ -315,14 +332,20 @@ class GiteeAIClient:
             "4096x4096": ("1:1", "4K"),
             "1024x576": ("16:9", "1K"),
             "2048x1152": ("16:9", "2K"),
+            "4096x2304": ("16:9", "4K"),
             "576x1024": ("9:16", "1K"),
             "1152x2048": ("9:16", "2K"),
+            "2304x4096": ("9:16", "4K"),
             "1152x896": ("4:3", "1K"),
             "2048x1536": ("4:3", "2K"),
+            "4096x3072": ("4:3", "4K"),
             "768x1024": ("3:4", "1K"),
             "1536x2048": ("3:4", "2K"),
+            "3072x4096": ("3:4", "4K"),
             "2048x1360": ("3:2", "2K"),
+            "4096x2720": ("3:2", "4K"),
             "1360x2048": ("2:3", "2K"),
+            "2720x4096": ("2:3", "4K"),
         }
         aspect_ratio = sizes.get(value, ("", ""))[0]
         resolution = sizes.get(value, ("", ""))[1]
@@ -478,7 +501,7 @@ class GiteeAIClient:
             body: dict[str, Any] = {
                 "model": str(provider.get("model", "z-image-turbo") or "z-image-turbo"),
                 "prompt": prompt,
-                "size": str(size or default_size),
+                "size": normalize_output_size(str(size or default_size), str(default_size)),
             }
             steps = provider.get("num_inference_steps", 9)
             try:
@@ -493,6 +516,7 @@ class GiteeAIClient:
             extra_body = provider.get("extra_body")
             if isinstance(extra_body, dict):
                 body.update(extra_body)
+            body["size"] = normalize_output_size(body.get("size"), str(default_size))
             payload = await self._request_json(
                 "POST",
                 f"{base_url}/images/generations",
@@ -509,11 +533,20 @@ class GiteeAIClient:
             raise GiteeAPIError("图片提示词不能为空")
         last_error: Exception | None = None
         for candidate in self._provider_candidates("draw"):
+            summary = self._provider_summary(candidate)
+            logger.info("[LifeCompanionImage] 文生图尝试服务商：%s", summary)
             try:
                 requested_size = candidate["output"] or self._operation_output("draw", size)
-                return await self._generate_provider(prompt, requested_size, candidate)
+                result = await self._generate_provider(prompt, requested_size, candidate)
+                logger.info("[LifeCompanionImage] 文生图实际使用服务商：%s", summary)
+                return result
             except Exception as exc:
                 last_error = exc
+                logger.warning(
+                    "[LifeCompanionImage] 文生图服务商 %s 失败，将尝试下一项：%s",
+                    summary,
+                    exc,
+                )
         raise GiteeAPIError(f"图片生成失败：{last_error}") from last_error
 
     async def _edit_provider(
@@ -576,7 +609,9 @@ class GiteeAIClient:
                 "prompt": prompt,
             }
             if size:
-                data["size"] = size
+                data["size"] = normalize_output_size(
+                    size, str(provider.get("default_size") or "auto")
+                )
             payload = await self._request_json(
                 "POST",
                 f"{self._normalize_openai_base_url(provider.get('base_url'))}/images/edits",
@@ -645,15 +680,33 @@ class GiteeAIClient:
                     raise
                 candidates = self._provider_candidates("edit")
             for candidate in candidates:
+                summary = self._provider_summary(candidate)
+                logger.info(
+                    "[LifeCompanionImage] %s尝试服务商：%s",
+                    "自拍" if operation == "selfie" else "改图",
+                    summary,
+                )
                 try:
                     requested_size = candidate["output"] or self._operation_output(
                         operation, size
                     )
-                    return await self._edit_provider(
+                    result = await self._edit_provider(
                         prompt, images, task_types, requested_size, candidate
                     )
+                    logger.info(
+                        "[LifeCompanionImage] %s实际使用服务商：%s",
+                        "自拍" if operation == "selfie" else "改图",
+                        summary,
+                    )
+                    return result
                 except Exception as exc:
                     last_error = exc
+                    logger.warning(
+                        "[LifeCompanionImage] %s服务商 %s 失败，将尝试下一项：%s",
+                        "自拍" if operation == "selfie" else "改图",
+                        summary,
+                        exc,
+                    )
             raise GiteeAPIError(f"图片修改失败：{last_error}") from last_error
 
         api_key = await self._next_key()

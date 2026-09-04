@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from core.gitee_client import GiteeAIClient, GiteeAPIError
-from core.prompting import build_selfie_prompt, split_size_suffix
+from core.prompting import build_selfie_prompt, normalize_output_size, split_size_suffix
 
 
 class FakeResponse:
@@ -47,6 +47,13 @@ class PromptingTest(unittest.TestCase):
     def test_ratio_suffix_maps_all_gitee_landscape_sizes(self):
         self.assertEqual(split_size_suffix("测试 4:3", "1024x1024")[1], "1152x896")
         self.assertEqual(split_size_suffix("测试 3:2", "1024x1024")[1], "2048x1360")
+
+    def test_combined_ratio_and_resolution_is_an_exact_size(self):
+        self.assertEqual(normalize_output_size("3:4 4K"), "3072x4096")
+        self.assertEqual(normalize_output_size("16:9 4K"), "4096x2304")
+        self.assertEqual(split_size_suffix("测试 3:4 4K", "1024x1024")[1], "3072x4096")
+        self.assertEqual(normalize_output_size("auto"), "auto")
+        self.assertEqual(normalize_output_size("1024x1024"), "1024x1024")
 
     def test_selfie_prompt_keeps_user_request_above_life_defaults(self):
         result = build_selfie_prompt(
@@ -195,6 +202,57 @@ class GiteeClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidates[0]["id"], "meinianda")
         self.assertEqual(candidates[0]["template"], "gemini_native")
         self.assertEqual(client._max_image_bytes(), 50 * 1024 * 1024)
+
+    async def test_generate_uses_first_provider_in_configured_chain(self):
+        image = b"generated-by-mengyu"
+        fake = FakeHTTPClient(
+            [
+                FakeResponse(
+                    payload={
+                        "data": [
+                            {"b64_json": base64.b64encode(image).decode()}
+                        ]
+                    }
+                )
+            ]
+        )
+        config = {
+            "features": {
+                "draw": {
+                    "chain": [
+                        {"provider_id": "mengyu"},
+                        {"provider_id": "meinianda"},
+                    ]
+                }
+            },
+            "providers": [
+                {
+                    "id": "mengyu",
+                    "__template_key": "openai_images",
+                    "base_url": "https://ai.zhicloud.top",
+                    "api_keys": ["mengyu-key"],
+                    "model": "gpt-image-2",
+                },
+                {
+                    "id": "meinianda",
+                    "__template_key": "gemini_native",
+                    "api_url": "https://meinianda.top",
+                    "api_keys": ["meinianda-key"],
+                    "model": "gemini-test",
+                },
+            ],
+        }
+        client = GiteeAIClient(config, Path(self.tmp.name), http_client=fake)
+
+        result = await client.generate("测试场景", size="3:4 4K")
+
+        self.assertEqual(result.read_bytes(), image)
+        self.assertEqual(
+            fake.requests[0][1],
+            "https://ai.zhicloud.top/v1/images/generations",
+        )
+        self.assertEqual(fake.requests[0][2]["json"]["model"], "gpt-image-2")
+        self.assertEqual(fake.requests[0][2]["json"]["size"], "3072x4096")
 
     async def test_gemini_provider_uses_copied_chain_output_settings(self):
         image = b"\x89PNG\r\nimage"

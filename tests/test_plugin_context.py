@@ -207,6 +207,20 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
         await plugin.aiimg_generate(event, prompt="发张自拍", mode="selfie_ref")
         plugin._selfie.assert_awaited_once_with(event, "发张自拍")
 
+    async def test_life_tool_auto_detects_selfie_from_original_user_message(self):
+        plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
+        plugin._draw = AsyncMock()
+        plugin._edit = AsyncMock()
+        plugin._selfie = AsyncMock()
+        event = types.SimpleNamespace(message_str="看看你")
+
+        result = await plugin.life_companion_image(event)
+
+        plugin._selfie.assert_awaited_once_with(event, "")
+        plugin._draw.assert_not_awaited()
+        plugin._edit.assert_not_awaited()
+        self.assertIn("图片生成任务已执行", result)
+
     async def test_life_context_uses_explicit_read_only_flag(self):
         life_plugin = _LifePlugin()
         plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
@@ -284,7 +298,7 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("新服务（new）：same-model", text)
         self.assertIn("当前首选服务商", text)
 
-    async def test_switch_all_uses_provider_name_and_keeps_fallbacks(self):
+    async def test_switch_all_replaces_current_provider_and_keeps_other_fallbacks(self):
         plugin = self._provider_plugin()
 
         await plugin.switch_image_provider(
@@ -295,7 +309,6 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
             plugin.config["features"]["draw"]["chain"],
             [
                 {"__template_key": "provider", "provider_id": "new"},
-                {"__template_key": "provider", "provider_id": "old"},
                 {"__template_key": "provider", "provider_id": "backup"},
             ],
         )
@@ -303,17 +316,17 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
             plugin.config["features"]["selfie"]["chain"],
             [
                 {"__template_key": "provider", "provider_id": "new"},
-                {"__template_key": "provider", "provider_id": "old"},
             ],
         )
         self.assertEqual(
             plugin.config["features"]["edit"]["chain"],
             [
                 {"__template_key": "provider", "provider_id": "new"},
-                {"__template_key": "provider", "provider_id": "old"},
             ],
         )
-        self.assertIn("文生图、自拍、改图", plugin._send_text.await_args.args[1])
+        message = plugin._send_text.await_args.args[1]
+        self.assertIn("文生图、自拍、改图", message)
+        self.assertIn("原首选服务商已从链路移除", message)
 
     async def test_switch_single_operation_changes_only_requested_chain(self):
         plugin = self._provider_plugin()
