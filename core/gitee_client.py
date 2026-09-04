@@ -166,12 +166,31 @@ class GiteeAIClient:
         return candidates
 
     @staticmethod
-    def _provider_summary(candidate: dict[str, Any]) -> str:
+    def _provider_model(candidate: dict[str, Any]) -> str:
         provider = candidate.get("config")
-        model = provider.get("model") if isinstance(provider, dict) else ""
+        if isinstance(provider, dict):
+            return str(provider.get("model") or "未填写").strip() or "未填写"
+        return "未填写"
+
+    @staticmethod
+    def _prompt_for_log(prompt: Any, limit: int = 4000) -> str:
+        text = " ".join(str(prompt or "").split())
+        if len(text) > limit:
+            return f"{text[:limit]}...（已截断）"
+        return text or "（空）"
+
+    @staticmethod
+    def _file_size_for_log(path: Path) -> str:
+        try:
+            return str(path.stat().st_size)
+        except OSError:
+            return "unknown"
+
+    @staticmethod
+    def _provider_summary(candidate: dict[str, Any]) -> str:
         return (
             f"{candidate.get('id', 'unknown')}"
-            f"（模型：{str(model or '未填写').strip()}，类型：{candidate.get('template', 'unknown')}）"
+            f"（模型：{GiteeAIClient._provider_model(candidate)}，类型：{candidate.get('template', 'unknown')}）"
         )
 
     def _provider_keys(self, provider: dict[str, Any]) -> list[str]:
@@ -534,17 +553,31 @@ class GiteeAIClient:
         last_error: Exception | None = None
         for candidate in self._provider_candidates("draw"):
             summary = self._provider_summary(candidate)
-            logger.info("[LifeCompanionImage] 文生图尝试服务商：%s", summary)
+            requested_size = candidate["output"] or self._operation_output("draw", size)
+            logger.info(
+                "[LifeCompanionImage] 文生图开始：服务商=%s，模型=%s，尺寸=%s，提示词=%s",
+                summary,
+                self._provider_model(candidate),
+                requested_size or "auto",
+                self._prompt_for_log(prompt),
+            )
+            started_at = time.perf_counter()
             try:
-                requested_size = candidate["output"] or self._operation_output("draw", size)
                 result = await self._generate_provider(prompt, requested_size, candidate)
-                logger.info("[LifeCompanionImage] 文生图实际使用服务商：%s", summary)
+                logger.info(
+                    "[LifeCompanionImage] 文生图完成：服务商=%s，模型=%s，耗时=%.2fs，输出=%s bytes",
+                    summary,
+                    self._provider_model(candidate),
+                    time.perf_counter() - started_at,
+                    self._file_size_for_log(result),
+                )
                 return result
             except Exception as exc:
                 last_error = exc
                 logger.warning(
-                    "[LifeCompanionImage] 文生图服务商 %s 失败，将尝试下一项：%s",
+                    "[LifeCompanionImage] 文生图服务商 %s 失败，将尝试下一项：耗时=%.2fs，原因=%s",
                     summary,
+                    time.perf_counter() - started_at,
                     exc,
                 )
         raise GiteeAPIError(f"图片生成失败：{last_error}") from last_error
@@ -681,30 +714,42 @@ class GiteeAIClient:
                 candidates = self._provider_candidates("edit")
             for candidate in candidates:
                 summary = self._provider_summary(candidate)
-                logger.info(
-                    "[LifeCompanionImage] %s尝试服务商：%s",
-                    "自拍" if operation == "selfie" else "改图",
-                    summary,
+                operation_label = "自拍" if operation == "selfie" else "改图"
+                requested_size = candidate["output"] or self._operation_output(
+                    operation, size
                 )
+                logger.info(
+                    "[LifeCompanionImage] %s开始：服务商=%s，模型=%s，尺寸=%s，参考图=%s张，参考图总大小=%s bytes，任务类型=%s，提示词=%s",
+                    operation_label,
+                    summary,
+                    self._provider_model(candidate),
+                    requested_size or "auto",
+                    len(images),
+                    sum(len(image) for image in images),
+                    ",".join(str(item) for item in (task_types or [])) or "默认",
+                    self._prompt_for_log(prompt),
+                )
+                started_at = time.perf_counter()
                 try:
-                    requested_size = candidate["output"] or self._operation_output(
-                        operation, size
-                    )
                     result = await self._edit_provider(
                         prompt, images, task_types, requested_size, candidate
                     )
                     logger.info(
-                        "[LifeCompanionImage] %s实际使用服务商：%s",
-                        "自拍" if operation == "selfie" else "改图",
+                        "[LifeCompanionImage] %s完成：服务商=%s，模型=%s，耗时=%.2fs，输出=%s bytes",
+                        operation_label,
                         summary,
+                        self._provider_model(candidate),
+                        time.perf_counter() - started_at,
+                        self._file_size_for_log(result),
                     )
                     return result
                 except Exception as exc:
                     last_error = exc
                     logger.warning(
-                        "[LifeCompanionImage] %s服务商 %s 失败，将尝试下一项：%s",
-                        "自拍" if operation == "selfie" else "改图",
+                        "[LifeCompanionImage] %s服务商 %s 失败，将尝试下一项：耗时=%.2fs，原因=%s",
+                        operation_label,
                         summary,
+                        time.perf_counter() - started_at,
                         exc,
                     )
             raise GiteeAPIError(f"图片修改失败：{last_error}") from last_error

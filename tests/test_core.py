@@ -2,6 +2,7 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from core.gitee_client import GiteeAIClient, GiteeAPIError
 from core.prompting import build_selfie_prompt, normalize_output_size, split_size_suffix
@@ -137,6 +138,104 @@ class GiteeClientTest(unittest.IsolatedAsyncioTestCase):
         )
         await client.generate("测试")
         self.assertEqual(client._base_url(), "https://example.test/v1")
+
+    async def test_generate_logs_model_prompt_and_never_logs_api_key(self):
+        image = b"generated-image"
+        config = {
+            "features": {
+                "draw": {
+                    "default_output": "16:9 4K",
+                    "chain": [{"provider_id": "mengyu"}],
+                }
+            },
+            "providers": [
+                {
+                    "id": "mengyu",
+                    "__template_key": "openai_images",
+                    "base_url": "https://example.test",
+                    "api_keys": ["secret-key"],
+                    "model": "gpt-image-test",
+                }
+            ],
+        }
+        fake = FakeHTTPClient(
+            [
+                FakeResponse(
+                    payload={
+                        "data": [{"b64_json": base64.b64encode(image).decode()}]
+                    }
+                )
+            ]
+        )
+        client = GiteeAIClient(config, Path(self.tmp.name), http_client=fake)
+
+        with patch("core.gitee_client.logger") as logger_mock:
+            await client.generate("夜晚街角的咖啡馆", size="16:9 4K")
+
+        messages = "\n".join(repr(call) for call in logger_mock.info.call_args_list)
+        self.assertIn("gpt-image-test", messages)
+        self.assertIn("夜晚街角的咖啡馆", messages)
+        self.assertIn("16:9 4K", messages)
+        self.assertNotIn("secret-key", messages)
+
+    async def test_edit_logs_model_prompt_and_reference_summary(self):
+        image = b"\x89PNG\r\nreference"
+        generated = b"\x89PNG\r\ngenerated"
+        config = {
+            "features": {
+                "selfie": {
+                    "default_output": "4K",
+                    "chain": [{"provider_id": "meinianda"}],
+                }
+            },
+            "providers": [
+                {
+                    "id": "meinianda",
+                    "__template_key": "gemini_native",
+                    "api_url": "https://example.test",
+                    "api_keys": ["secret-key"],
+                    "model": "gemini-image-test",
+                    "max_retries": 0,
+                }
+            ],
+        }
+        fake = FakeHTTPClient(
+            [
+                FakeResponse(
+                    payload={
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [
+                                        {
+                                            "inlineData": {
+                                                "mimeType": "image/png",
+                                                "data": base64.b64encode(generated).decode(),
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                )
+            ]
+        )
+        client = GiteeAIClient(config, Path(self.tmp.name), http_client=fake)
+
+        with patch("core.gitee_client.logger") as logger_mock:
+            await client.edit("窗边自然入镜", [image], operation="selfie")
+
+        start_call = next(
+            call
+            for call in logger_mock.info.call_args_list
+            if "%s开始" in str(call.args[0])
+        )
+        self.assertIn("gemini-image-test", start_call.args)
+        self.assertIn("窗边自然入镜", start_call.args)
+        self.assertEqual(start_call.args[5], 1)
+        messages = "\n".join(repr(call) for call in logger_mock.info.call_args_list)
+        self.assertNotIn("secret-key", messages)
 
     async def test_edit_polls_until_success_and_downloads_url(self):
         image = b"\xff\xd8\xffjpeg"
