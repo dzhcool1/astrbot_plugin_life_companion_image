@@ -34,6 +34,9 @@ class FakeHTTPClient:
             return self.download
         return self.responses.pop(0)
 
+    async def post(self, url, **kwargs):
+        return await self.request("POST", url, **kwargs)
+
 
 class PromptingTest(unittest.TestCase):
     def test_ratio_suffix_uses_gitee_whitelist_size(self):
@@ -165,3 +168,89 @@ class GiteeClientTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(GiteeAPIError, "API Key"):
             await client.generate("测试")
         self.assertEqual(fake.requests, [])
+
+    async def test_v5_provider_config_uses_draw_chain_and_network_limit(self):
+        config = {
+            "features": {
+                "draw": {
+                    "default_output": "16:9 4K",
+                    "chain": [{"provider_id": "meinianda"}],
+                }
+            },
+            "network": {"max_image_bytes": 50 * 1024 * 1024},
+            "providers": [
+                {
+                    "id": "meinianda",
+                    "__template_key": "gemini_native",
+                    "api_url": "https://example.test",
+                    "api_keys": ["key-a"],
+                    "model": "gemini-test",
+                }
+            ],
+        }
+        client = GiteeAIClient(config, Path(self.tmp.name))
+
+        candidates = client._provider_candidates("draw")
+
+        self.assertEqual(candidates[0]["id"], "meinianda")
+        self.assertEqual(candidates[0]["template"], "gemini_native")
+        self.assertEqual(client._max_image_bytes(), 50 * 1024 * 1024)
+
+    async def test_gemini_provider_uses_copied_chain_output_settings(self):
+        image = b"\x89PNG\r\nimage"
+        fake = FakeHTTPClient(
+            [
+                FakeResponse(
+                    payload={
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [
+                                        {
+                                            "inlineData": {
+                                                "mimeType": "image/png",
+                                                "data": base64.b64encode(image).decode(),
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                )
+            ]
+        )
+        config = {
+            "features": {
+                "draw": {
+                    "default_output": "16:9 4K",
+                    "chain": [{"provider_id": "meinianda"}],
+                }
+            },
+            "providers": [
+                {
+                    "id": "meinianda",
+                    "__template_key": "gemini_native",
+                    "api_url": "https://example.test",
+                    "api_keys": ["key-a"],
+                    "model": "gemini-test",
+                    "max_retries": 0,
+                }
+            ],
+        }
+        client = GiteeAIClient(config, Path(self.tmp.name), http_client=fake)
+
+        result = await client.generate("测试场景")
+
+        self.assertEqual(result.read_bytes(), image)
+        method, url, request = fake.requests[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url,
+            "https://example.test/v1beta/models/gemini-test:generateContent",
+        )
+        self.assertEqual(request["headers"]["x-goog-api-key"], "key-a")
+        self.assertEqual(
+            request["json"]["generationConfig"]["imageConfig"],
+            {"imageSize": "4K", "aspectRatio": "16:9"},
+        )

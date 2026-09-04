@@ -10,7 +10,7 @@
 - 生活自拍：`/生活自拍 [补充要求]`，使用参考人像和 Life Companion 状态调用 Gitee 异步改图接口。
 - 图片修改：发送图片并使用 `/生活改图 <修改要求>`。
 - 参考照管理：发送图片并使用 `/生活参考照 设置`；查看或删除使用 `/生活参考照 查看`、`/生活参考照 删除`。
-- LLM 工具：`life_companion_image`，`mode` 可选 `life_photo` 或 `selfie`。
+- LLM 工具：`life_companion_image`，`mode` 可选 `life_photo` 或 `selfie`；兼容旧 Gitee 工具名 `aiimg_generate`。
 - API Key 池轮询、Base64/URL 图片结果、结果本地缓存，以及图片消息失败时的文件发送回退。
 
 ## 安装
@@ -25,18 +25,13 @@ pip install -r requirements.txt
 
 ## 配置
 
-在 WebUI 配置以下项目：
+WebUI 配置结构与 `astrbot_plugin_gitee_aiimg v5.1.30` 对齐，包含 `features`、`storage`、`image_encoding`、`send`、`network`、`providers`、并发和防抖等全部配置项。服务商链路按 `features.draw.chain`、`features.edit.chain` 和 `features.selfie.chain` 的顺序尝试，服务商参数集中放在 `providers` 中。
 
-| 配置 | 默认值 | 说明 |
-| --- | --- | --- |
-| `api_base_url` | `https://ai.gitee.com/v1` | Gitee AI Base URL |
-| `api_keys` | `[]` | 一个或多个 Gitee AI API Key |
-| `model` | `z-image-turbo` | 文生图模型 |
-| `default_size` | `1024x1024` | Gitee 白名单尺寸 |
-| `edit_model` | `Qwen-Image-Edit-2511` | 自拍/改图模型 |
-| `use_life_companion` | `true` | 是否读取 Life Companion 的缓存状态 |
+生活插件实际使用文生图、改图和自拍链路；当前支持 Gitee Images、Gitee Async、Gemini 原生和 OpenAI Images 兼容服务商。复制其它服务商配置不会丢失设置，但生活插件不会为未支持的服务商伪造兼容性。
 
-参考照建议使用命令保存。配置里的 `reference_images` 只接受插件数据目录内的路径，插件会拒绝数据目录外的路径。
+Life Companion 专用兼容项为 `use_life_companion`、`reference_images` 和 `selfie_prompt_prefix`。推荐使用 `features.selfie.reference_images` 管理参考照，或通过 `/生活参考照 设置`、`查看`、`删除` 管理。参考照路径只接受插件数据目录内的路径，插件会拒绝数据目录外的路径。
+
+`network.max_image_bytes` 默认是 52428800（50 MiB），用于限制下载或返回的单张图片大小。
 
 ## API 说明
 
