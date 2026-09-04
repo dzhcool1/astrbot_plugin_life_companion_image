@@ -2,6 +2,13 @@
 
 本文件记录 `astrbot_plugin_life_companion_image` 的重要变更。
 
+## v1.1.4 - 2026-09-04
+
+### 修复
+
+- 修复 `/切换生图` 新增服务商链路项缺少 `__template_key: provider` 的问题，避免 AstrBot WebUI 显示“未指定模板”。
+- 保留原有链路项的完整结构，并为新链路项写入符合 `template_list` 要求的模板标识。
+
 ## v1.1.3 - 2026-09-04
 
 ### 新增

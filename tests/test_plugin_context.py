@@ -153,9 +153,18 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
         plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
         plugin.config = {
             "features": {
-                "draw": {"chain": [{"provider_id": "old"}, {"provider_id": "backup"}]},
-                "selfie": {"chain": [{"provider_id": "old"}]},
-                "edit": {"chain": [{"provider_id": "old"}]},
+                "draw": {
+                    "chain": [
+                        {"__template_key": "provider", "provider_id": "old"},
+                        {"__template_key": "provider", "provider_id": "backup"},
+                    ]
+                },
+                "selfie": {
+                    "chain": [{"__template_key": "provider", "provider_id": "old"}]
+                },
+                "edit": {
+                    "chain": [{"__template_key": "provider", "provider_id": "old"}]
+                },
             },
             "providers": [
                 {
@@ -284,13 +293,25 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             plugin.config["features"]["draw"]["chain"],
-            [{"provider_id": "new"}, {"provider_id": "old"}, {"provider_id": "backup"}],
+            [
+                {"__template_key": "provider", "provider_id": "new"},
+                {"__template_key": "provider", "provider_id": "old"},
+                {"__template_key": "provider", "provider_id": "backup"},
+            ],
         )
         self.assertEqual(
-            plugin.config["features"]["selfie"]["chain"], [{"provider_id": "new"}, {"provider_id": "old"}]
+            plugin.config["features"]["selfie"]["chain"],
+            [
+                {"__template_key": "provider", "provider_id": "new"},
+                {"__template_key": "provider", "provider_id": "old"},
+            ],
         )
         self.assertEqual(
-            plugin.config["features"]["edit"]["chain"], [{"provider_id": "new"}, {"provider_id": "old"}]
+            plugin.config["features"]["edit"]["chain"],
+            [
+                {"__template_key": "provider", "provider_id": "new"},
+                {"__template_key": "provider", "provider_id": "old"},
+            ],
         )
         self.assertIn("文生图、自拍、改图", plugin._send_text.await_args.args[1])
 
@@ -301,9 +322,18 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
             types.SimpleNamespace(message_str="/切换生图 文生图 新服务")
         )
 
-        self.assertEqual(plugin.config["features"]["draw"]["chain"][0], {"provider_id": "new"})
-        self.assertEqual(plugin.config["features"]["selfie"]["chain"][0], {"provider_id": "old"})
-        self.assertEqual(plugin.config["features"]["edit"]["chain"][0], {"provider_id": "old"})
+        self.assertEqual(
+            plugin.config["features"]["draw"]["chain"][0],
+            {"__template_key": "provider", "provider_id": "new"},
+        )
+        self.assertEqual(
+            plugin.config["features"]["selfie"]["chain"][0],
+            {"__template_key": "provider", "provider_id": "old"},
+        )
+        self.assertEqual(
+            plugin.config["features"]["edit"]["chain"][0],
+            {"__template_key": "provider", "provider_id": "old"},
+        )
 
     async def test_switch_rejects_unsupported_provider_without_partial_change(self):
         plugin = self._provider_plugin()
@@ -320,7 +350,10 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
             types.SimpleNamespace(message_str="/切换生图 仅文生图")
         )
 
-        self.assertEqual(plugin.config["features"]["draw"]["chain"][0], {"provider_id": "old"})
+        self.assertEqual(
+            plugin.config["features"]["draw"]["chain"][0],
+            {"__template_key": "provider", "provider_id": "old"},
+        )
         self.assertIn("不支持", plugin._send_text.await_args.args[1])
 
     async def test_switch_does_not_treat_model_name_as_provider_name(self):
@@ -330,5 +363,8 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
             types.SimpleNamespace(message_str="/切换生图 same-model")
         )
 
-        self.assertEqual(plugin.config["features"]["draw"]["chain"][0], {"provider_id": "old"})
+        self.assertEqual(
+            plugin.config["features"]["draw"]["chain"][0],
+            {"__template_key": "provider", "provider_id": "old"},
+        )
         self.assertIn("没有找到服务商", plugin._send_text.await_args.args[1])

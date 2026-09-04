@@ -442,7 +442,10 @@ class LifeCompanionImagePlugin(Star):
                     selected = item
                 continue
             fallback.append(item)
-        section["chain"] = [selected or {"provider_id": provider_id}, *fallback]
+        section["chain"] = [
+            selected or {"__template_key": "provider", "provider_id": provider_id},
+            *fallback,
+        ]
 
     async def _reference_images(self, event: AstrMessageEvent) -> list[bytes]:
         configured = self._configured_reference_paths()
