@@ -5,7 +5,6 @@ import base64
 import binascii
 import inspect
 import re
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +23,7 @@ class LifeCompanionImagePlugin(Star):
     _WAIT_MESSAGE_TIMEOUT = 2.5
     _WAIT_MESSAGE_SYSTEM_PROMPT = (
         "你现在只负责替主人先接住用户的话。请结合已有的人设、对话上下文和用户语气，"
-        "写一句简短、自然、像真人聊天一样的中文承接话。图片工作已经开始，但结果尚未完成，"
+        "写一句简短、自然、像真人聊天一样的中文承接话。图片请求会在这句话发送后开始，"
         "所以不要说已经好了、完成了、发给你了或图片来了。不要提生成、插件、模型、API、接口、"
         "提示词、任务、请稍候等技术内容，也不要解释。只输出这一句承接话。"
     )
@@ -627,9 +626,7 @@ class LifeCompanionImagePlugin(Star):
         request_prompt: str,
         image_operation: Any,
     ) -> None:
-        image_task = asyncio.create_task(image_operation)
         try:
-            await asyncio.sleep(0)
             try:
                 notice = await asyncio.wait_for(
                     self._contextual_wait_message(event, operation, request_prompt),
@@ -642,13 +639,11 @@ class LifeCompanionImagePlugin(Star):
                 logger.debug("[LifeCompanionImage] 动态承接话异常：%s", exc)
                 notice = self._wait_message_fallback(operation)
             await self._send_text(event, notice)
-            path = await image_task
+            path = await image_operation
             await self._send_image(event, path)
         finally:
-            if not image_task.done():
-                image_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await image_task
+            if inspect.iscoroutine(image_operation):
+                image_operation.close()
 
     async def _send_image(self, event: AstrMessageEvent, path: Path) -> None:
         try:

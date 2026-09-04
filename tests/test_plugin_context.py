@@ -259,31 +259,35 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plugin.context.calls[0]["tools"])
         self.assertIn("她说话自然、亲近。", plugin.context.calls[0]["system_prompt"])
 
-    async def test_image_starts_before_dynamic_wait_message_and_sends_image_after_notice(self):
+    async def test_dynamic_wait_message_is_sent_before_image_starts(self):
         plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
         event = _SendEvent()
         image_started = False
+        notice_sent = False
 
         async def image_operation():
             nonlocal image_started
+            self.assertTrue(notice_sent)
             image_started = True
             return Path("/tmp/generated-test.jpg")
 
         async def wait_message(*args):
-            self.assertTrue(image_started)
+            self.assertFalse(image_started)
             return "你等等呀，我给你找个好看的角度。"
 
+        async def send_text(*args):
+            nonlocal notice_sent
+            notice_sent = True
+
         plugin._contextual_wait_message = wait_message
-        plugin._send_text = AsyncMock()
+        plugin._send_text = send_text
         plugin._send_image = AsyncMock()
 
         await plugin._generate_with_notice(
             event, "selfie", "窗边喝咖啡", image_operation()
         )
 
-        plugin._send_text.assert_awaited_once_with(
-            event, "你等等呀，我给你找个好看的角度。"
-        )
+        self.assertTrue(notice_sent)
         plugin._send_image.assert_awaited_once_with(
             event, Path("/tmp/generated-test.jpg")
         )
