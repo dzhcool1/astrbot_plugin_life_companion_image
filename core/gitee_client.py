@@ -424,6 +424,7 @@ class GiteeAIClient:
         images: list[bytes] | None = None,
         size: str | None = None,
     ) -> Path:
+        source_images = list(images or [])
         api_key = await self._next_provider_key(provider)
         model = str(provider.get("model") or "gemini-3-pro-image-preview").strip()
         url = f"{self._gemini_models_base_url(provider.get('api_url'))}/{model}:generateContent"
@@ -434,14 +435,14 @@ class GiteeAIClient:
             f"Generate a high quality {resolution} resolution image. "
             f"Follow this instruction: {prompt}. Output the image directly."
         )
-        if images:
+        if source_images:
             instruction = (
                 f"Re-imagine the attached image based on this instruction: {prompt}. "
                 f"Generate a high quality {resolution} resolution image. "
                 "Output the transformed image directly."
             )
         parts: list[dict[str, Any]] = [{"text": instruction}]
-        for image in images or []:
+        for image in source_images:
             parts.append(
                 {
                     "inlineData": {
@@ -461,6 +462,13 @@ class GiteeAIClient:
                 "imageConfig": image_config,
             },
         }
+        logger.info(
+            "[LifeCompanionImage] Gemini 请求已构造：模型=%s，imageConfig=%s，参考图=%s张，参考图总大小=%s bytes",
+            model,
+            image_config,
+            len(source_images),
+            sum(len(image) for image in source_images),
+        )
         client = await self._get_client()
         retries = max(0, min(int(provider.get("max_retries", 2) or 0), 10))
         timeout = self._provider_timeout(provider)
@@ -494,6 +502,18 @@ class GiteeAIClient:
                     raise error
                 last_error = error
             except httpx.HTTPError as exc:
+                if isinstance(exc, httpx.ReadError):
+                    logger.warning(
+                        "[LifeCompanionImage] Gemini 在返回响应前断开连接：尝试=%d/%d，"
+                        "参考图=%d张，原图总大小=%d bytes；本次不重试，避免重复提交",
+                        attempt + 1,
+                        retries + 1,
+                        len(source_images),
+                        sum(len(image) for image in source_images),
+                    )
+                    raise GiteeAPIError(
+                        "Gemini 上游在返回响应前关闭连接，请减少参考图数量或稍后重试"
+                    ) from exc
                 error = GiteeAPIError("Gemini 网络请求失败，请检查网络或 API 地址")
                 if attempt >= retries:
                     raise error from exc

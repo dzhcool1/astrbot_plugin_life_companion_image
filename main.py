@@ -5,27 +5,84 @@ import base64
 import binascii
 import inspect
 import re
+import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File, Image, Reply
+from astrbot.api.message_components import File, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 
 from .core.gitee_client import GiteeAIClient, GiteeAPIError
 from .core.prompting import build_selfie_prompt, split_size_suffix
 
 
+class ImageCommandWakePrefixFilter(filter.CustomFilter):
+    """Keep image commands aligned with AstrBot's configured wake behavior."""
+
+    @staticmethod
+    def _wake_prefixes(cfg: object) -> tuple[str, ...]:
+        try:
+            raw = cfg.get("wake_prefix", ["/"])
+        except Exception:
+            raw = ["/"]
+        if isinstance(raw, str):
+            return (raw,) if raw else ("/",)
+        if isinstance(raw, (list, tuple, set)):
+            return tuple(str(item) for item in raw if str(item)) or ("/",)
+        return ("/",)
+
+    @staticmethod
+    def _is_private_chat(event: AstrMessageEvent) -> bool:
+        try:
+            return bool(event.is_private_chat())
+        except Exception:
+            message_obj = getattr(event, "message_obj", None)
+            return not bool(getattr(message_obj, "group", None))
+
+    @staticmethod
+    def _plain_has_configured_prefix(
+        text: str, prefixes: tuple[str, ...]
+    ) -> bool:
+        plain = str(text or "").lstrip()
+        for prefix in prefixes:
+            if not plain.startswith(prefix):
+                continue
+            end = len(prefix)
+            if end < len(plain) and not plain[end].isspace():
+                return True
+        return False
+
+    def filter(self, event: AstrMessageEvent, cfg: object) -> bool:
+        if self._is_private_chat(event):
+            return bool(getattr(event, "is_at_or_wake_command", False))
+        prefixes = self._wake_prefixes(cfg)
+        try:
+            chain = event.get_messages()
+        except Exception:
+            chain = []
+        return any(
+            isinstance(segment, Plain)
+            and self._plain_has_configured_prefix(
+                str(getattr(segment, "text", "") or ""), prefixes
+            )
+            for segment in chain or []
+        )
+
+
 class LifeCompanionImagePlugin(Star):
     """Gitee AI 图片生成 with optional Life Companion context."""
 
     _WAIT_MESSAGE_TIMEOUT = 2.5
+    _REFERENCE_REQUEST_BUDGET = 40 * 1024 * 1024
     _WAIT_MESSAGE_SYSTEM_PROMPT = (
         "你现在只负责替主人先接住用户的话。请结合已有的人设、对话上下文和用户语气，"
-        "写一句简短、自然、像真人聊天一样的中文承接话。图片请求会在这句话发送后开始，"
+        "写一句简短、自然、像真人聊天一样的中文承接话。图片请求已经开始，但结果尚未完成，"
         "所以不要说已经好了、完成了、发给你了或图片来了。不要提生成、插件、模型、API、接口、"
-        "提示词、任务、请稍候等技术内容，也不要解释。只输出这一句承接话。"
+        "提示词、任务、请稍候等技术内容，也不要解释。不要套用固定句式或重复上一轮的说法，"
+        "要根据最近对话中的称呼、情绪和具体内容自然发挥。只输出这一句承接话。"
     )
 
     _LIFE_PLUGIN_NAMES = (
@@ -100,6 +157,20 @@ class LifeCompanionImagePlugin(Star):
                 if inspect.isawaitable(result):
                     result = await result
                 if isinstance(result, dict):
+                    timeline = result.get("timeline")
+                    timeline_count = (
+                        sum(1 for item in timeline if isinstance(item, dict))
+                        if isinstance(timeline, list)
+                        else 0
+                    )
+                    logger.info(
+                        "[LifeCompanionImage] 已读取生活状态：来源=%s，日期=%s，日程=%s，时间线=%d条，穿搭=%s",
+                        plugin_name,
+                        str(result.get("date") or "未知").strip(),
+                        "有" if str(result.get("schedule") or "").strip() else "无",
+                        timeline_count,
+                        "有" if str(result.get("outfit") or "").strip() else "无",
+                    )
                     return result
             except TypeError:
                 # Do not retry without the keyword: old APIs may generate an LLM
@@ -154,6 +225,21 @@ class LifeCompanionImagePlugin(Star):
                     f"自然真实的今日生活照，穿着：{outfit or '日常穿搭'}；"
                     f"场景和活动：{schedule or '轻松日常'}"
                 )
+        schedule = str(life_context.get("schedule") or "").strip()
+        timeline = life_context.get("timeline")
+        timeline_activities = [
+            str(item.get("activity") or item.get("title") or item.get("text") or "").strip()
+            for item in timeline
+            if isinstance(item, dict)
+        ] if isinstance(timeline, list) else []
+        logger.info(
+            "[LifeCompanionImage] 生活状态已响应给图片提示词：操作=%s，日程=%s，时间线=%d条，日程已写入=%s，时间线已写入=%s",
+            operation,
+            "有" if schedule else "无",
+            len(timeline_activities),
+            "是" if schedule and schedule in prompt else "否",
+            "是" if any(activity and activity in prompt for activity in timeline_activities) else "否",
+        )
         return prompt, size, life_context
 
     @staticmethod
@@ -464,7 +550,7 @@ class LifeCompanionImagePlugin(Star):
 
     async def _reference_images(self, event: AstrMessageEvent) -> list[bytes]:
         configured = self._configured_reference_paths()
-        result = []
+        result: list[bytes] = []
         for path in configured:
             try:
                 data = path.read_bytes()
@@ -474,8 +560,34 @@ class LifeCompanionImagePlugin(Star):
                 result.append(data)
         if result:
             result.extend((await self._event_images(event))[:4])
-            return result
-        return (await self._event_images(event))[:8]
+        else:
+            result = (await self._event_images(event))[:8]
+
+        return self._select_reference_images(result)
+
+    def _select_reference_images(self, candidates: list[bytes]) -> list[bytes]:
+        selected: list[bytes] = []
+        selected_bytes = 0
+        skipped = 0
+        for image in candidates:
+            if not image:
+                continue
+            if selected and selected_bytes + len(image) > self._REFERENCE_REQUEST_BUDGET:
+                skipped += 1
+                continue
+            selected.append(image)
+            selected_bytes += len(image)
+        if skipped:
+            logger.warning(
+                "[LifeCompanionImage] 参考图请求超过单次原图预算：候选=%d张/%d bytes，"
+                "保留=%d张/%d bytes，跳过=%d张；未压缩或重编码原图",
+                len(candidates),
+                sum(len(image) for image in candidates),
+                len(selected),
+                selected_bytes,
+                skipped,
+            )
+        return selected
 
     @staticmethod
     def _image_extension(data: bytes) -> str:
@@ -523,12 +635,12 @@ class LifeCompanionImagePlugin(Star):
         return text
 
     @staticmethod
-    def _wait_message_fallback(operation: str) -> str:
+    def _llm_tool_failure_message(operation: str) -> str:
         return {
-            "draw": "好呀，我这就按你说的来一张。",
-            "selfie": "好呀，我这就给你拍拍看。",
-            "edit": "嗯，我照你说的改改看。",
-        }.get(operation, "好呀，我先按你说的来看看。")
+            "draw": "图片请求未执行。请自然地告诉用户需要先提供图片描述。",
+            "selfie": "图片请求未执行。请自然地告诉用户需要先提供一张人物参考图。",
+            "edit": "图片请求未执行。请自然地告诉用户需要在消息中附带要修改的图片。",
+        }.get(operation, "图片请求未执行。请自然地告诉用户当前请求缺少必要信息。")
 
     async def _contextual_wait_message(
         self,
@@ -536,7 +648,6 @@ class LifeCompanionImagePlugin(Star):
         operation: str,
         request_prompt: str,
     ) -> str:
-        fallback = self._wait_message_fallback(operation)
         try:
             provider = None
             selected_provider = str(
@@ -551,7 +662,7 @@ class LifeCompanionImagePlugin(Star):
             if provider is None:
                 get_using_provider = getattr(self.context, "get_using_provider", None)
                 if not callable(get_using_provider):
-                    return fallback
+                    return ""
                 try:
                     provider = get_using_provider(
                         umo=getattr(event, "unified_msg_origin", None)
@@ -561,7 +672,7 @@ class LifeCompanionImagePlugin(Star):
                 if inspect.isawaitable(provider):
                     provider = await provider
             if provider is None:
-                return fallback
+                return ""
 
             provider_config = getattr(provider, "provider_config", {})
             provider_id = (
@@ -577,7 +688,7 @@ class LifeCompanionImagePlugin(Star):
                         provider_meta = await provider_meta
                     provider_id = getattr(provider_meta, "id", None)
             if not provider_id:
-                return fallback
+                return ""
 
             request = self._event_extra(event, "provider_request")
             contexts = self._request_value(request, "contexts")
@@ -600,7 +711,7 @@ class LifeCompanionImagePlugin(Star):
             )
             llm_generate = getattr(self.context, "llm_generate", None)
             if not callable(llm_generate):
-                return fallback
+                return ""
             response = await llm_generate(
                 chat_provider_id=str(provider_id),
                 prompt=prompt,
@@ -614,10 +725,10 @@ class LifeCompanionImagePlugin(Star):
                 get_plain_text = getattr(result_chain, "get_plain_text", None)
                 if callable(get_plain_text):
                     text = get_plain_text()
-            return self._clean_wait_message(text) or fallback
+            return self._clean_wait_message(text)
         except Exception as exc:
             logger.debug("[LifeCompanionImage] 动态承接话生成失败：%s", exc)
-            return fallback
+            return ""
 
     async def _generate_with_notice(
         self,
@@ -626,6 +737,15 @@ class LifeCompanionImagePlugin(Star):
         request_prompt: str,
         image_operation: Any,
     ) -> None:
+        started_at = time.perf_counter()
+        image_started_at: float | None = None
+
+        async def run_image_operation() -> Any:
+            nonlocal image_started_at
+            image_started_at = time.perf_counter()
+            return await image_operation
+
+        image_task = asyncio.ensure_future(run_image_operation())
         try:
             try:
                 notice = await asyncio.wait_for(
@@ -633,25 +753,60 @@ class LifeCompanionImagePlugin(Star):
                     timeout=self._WAIT_MESSAGE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.debug("[LifeCompanionImage] 动态承接话超时，使用自然兜底")
-                notice = self._wait_message_fallback(operation)
+                logger.debug("[LifeCompanionImage] 动态承接话超时，不发送承接话")
+                notice = ""
             except Exception as exc:
                 logger.debug("[LifeCompanionImage] 动态承接话异常：%s", exc)
-                notice = self._wait_message_fallback(operation)
-            await self._send_text(event, notice)
-            path = await image_operation
+                notice = ""
+            if notice:
+                await self._send_text(event, notice)
+            else:
+                logger.info("[LifeCompanionImage] 未生成合适的动态承接话，继续发送图片")
+            notice_sent_at = time.perf_counter()
+            path = await image_task
+            image_finished_at = time.perf_counter()
+            send_started_at = image_finished_at
             await self._send_image(event, path)
+            finished_at = time.perf_counter()
+            logger.info(
+                "[LifeCompanionImage] 图片链路完成：操作=%s，进入插件后承接话耗时=%.2fs，图片请求耗时=%.2fs，图片发送耗时=%.2fs，总耗时=%.2fs",
+                operation,
+                notice_sent_at - started_at,
+                image_finished_at - (image_started_at or started_at),
+                finished_at - send_started_at,
+                finished_at - started_at,
+            )
         finally:
-            if inspect.iscoroutine(image_operation):
-                image_operation.close()
+            if not image_task.done():
+                image_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await image_task
 
     async def _send_image(self, event: AstrMessageEvent, path: Path) -> None:
+        started_at = time.perf_counter()
+        try:
+            image_size = path.stat().st_size
+        except OSError:
+            image_size = "unknown"
+        logger.info(
+            "[LifeCompanionImage] 图片发送开始：文件=%s，大小=%s bytes",
+            path.name,
+            image_size,
+        )
         try:
             await event.send(event.chain_result([Image.fromFileSystem(str(path))]))
+            logger.info(
+                "[LifeCompanionImage] 图片发送结束：文件=%s，耗时=%.2fs",
+                path.name,
+                time.perf_counter() - started_at,
+            )
         except Exception as first_exc:
             logger.warning("[LifeCompanionImage] 图片消息发送失败，尝试文件发送：%s", first_exc)
-            await event.send(
-                event.chain_result([File(name=path.name, file=str(path))])
+            await event.send(event.chain_result([File(name=path.name, file=str(path))]))
+            logger.info(
+                "[LifeCompanionImage] 图片文件发送结束：文件=%s，耗时=%.2fs",
+                path.name,
+                time.perf_counter() - started_at,
             )
 
     async def _ensure_client(self) -> GiteeAIClient:
@@ -659,23 +814,30 @@ class LifeCompanionImagePlugin(Star):
             raise GiteeAPIError("图片插件尚未初始化")
         return self.client
 
-    async def _draw(self, event: AstrMessageEvent, raw_prompt: str) -> None:
+    async def _draw(
+        self, event: AstrMessageEvent, raw_prompt: str, *, notify: bool = True
+    ) -> str | None:
         if not self._feature_enabled("draw"):
-            await self._send_text(event, "文生图功能已关闭。")
-            return
+            message = "文生图功能已关闭。"
+            if notify:
+                await self._send_text(event, message)
+            return message
         prompt, size, _ = await self._prepare_prompt(
             raw_prompt, operation="draw", allow_generate=False
         )
         if not prompt:
-            await self._send_text(event, "请提供图片提示词，例如：/生活照 阳台上的下午茶")
-            return
+            message = "请提供图片提示词，例如：/生活照 阳台上的下午茶"
+            if notify:
+                await self._send_text(event, message)
+            return message
         client = await self._ensure_client()
         await self._generate_with_notice(
             event,
             "draw",
-            raw_prompt or prompt,
+            raw_prompt or str(getattr(event, "message_str", "") or "").strip() or prompt,
             client.generate(prompt, size=size),
         )
+        return None
 
     async def _selfie(
         self,
@@ -683,10 +845,14 @@ class LifeCompanionImagePlugin(Star):
         raw_prompt: str,
         *,
         announce: bool = True,
-    ) -> None:
+        notify: bool = True,
+    ) -> str | None:
+        started_at = time.perf_counter()
         if not self._feature_enabled("selfie"):
-            await self._send_text(event, "生活自拍功能已关闭。")
-            return
+            message = "生活自拍功能已关闭。"
+            if notify:
+                await self._send_text(event, message)
+            return message
         prompt, size, _ = await self._prepare_prompt(
             raw_prompt,
             selfie=True,
@@ -695,18 +861,19 @@ class LifeCompanionImagePlugin(Star):
         )
         images = await self._reference_images(event)
         if not images:
-            await self._send_text(
-                event,
+            message = (
                 "还没有自拍参考照。请发送一张图片并使用：/生活参考照 设置；"
-                "也可以在同一条消息附图后直接使用 /生活自拍。",
+                "也可以在同一条消息附图后直接使用 /生活自拍。"
             )
-            return
+            if notify:
+                await self._send_text(event, message)
+            return message
+        client = await self._ensure_client()
         if announce:
-            client = await self._ensure_client()
             await self._generate_with_notice(
                 event,
                 "selfie",
-                raw_prompt or prompt,
+                raw_prompt or str(getattr(event, "message_str", "") or "").strip() or prompt,
                 client.edit(
                     prompt,
                     images,
@@ -715,8 +882,14 @@ class LifeCompanionImagePlugin(Star):
                     operation="selfie",
                 ),
             )
-            return
-        client = await self._ensure_client()
+            return None
+        request_started_at = time.perf_counter()
+        logger.info(
+            "[LifeCompanionImage] 自拍直达图片请求开始：前置处理耗时=%.2fs，参考图=%d张，尺寸=%s",
+            request_started_at - started_at,
+            len(images),
+            size or "auto",
+        )
         path = await client.edit(
             prompt,
             images,
@@ -724,7 +897,16 @@ class LifeCompanionImagePlugin(Star):
             size=size,
             operation="selfie",
         )
+        request_finished_at = time.perf_counter()
         await self._send_image(event, path)
+        finished_at = time.perf_counter()
+        logger.info(
+            "[LifeCompanionImage] 自拍直达链路完成：图片请求耗时=%.2fs，图片发送耗时=%.2fs，总耗时=%.2fs",
+            request_finished_at - request_started_at,
+            finished_at - request_finished_at,
+            finished_at - started_at,
+        )
+        return None
 
     async def generate_life_photo(
         self, event: AstrMessageEvent, prompt: str = ""
@@ -732,14 +914,20 @@ class LifeCompanionImagePlugin(Star):
         """Public bridge used by ``astrbot_plugin_life_companion``."""
         await self._selfie(event, prompt, announce=True)
 
-    async def _edit(self, event: AstrMessageEvent, raw_prompt: str) -> None:
+    async def _edit(
+        self, event: AstrMessageEvent, raw_prompt: str, *, notify: bool = True
+    ) -> str | None:
         if not self._feature_enabled("edit"):
-            await self._send_text(event, "改图功能已关闭。")
-            return
+            message = "改图功能已关闭。"
+            if notify:
+                await self._send_text(event, message)
+            return message
         images = await self._event_images(event)
         if not images:
-            await self._send_text(event, "请在消息中附带需要修改的图片。")
-            return
+            message = "请在消息中附带需要修改的图片。"
+            if notify:
+                await self._send_text(event, message)
+            return message
         prompt, size, _ = await self._prepare_prompt(
             raw_prompt,
             selfie=True,
@@ -750,7 +938,7 @@ class LifeCompanionImagePlugin(Star):
         await self._generate_with_notice(
             event,
             "edit",
-            raw_prompt or prompt,
+            raw_prompt or str(getattr(event, "message_str", "") or "").strip() or prompt,
             client.edit(
                 prompt,
                 images,
@@ -759,6 +947,7 @@ class LifeCompanionImagePlugin(Star):
                 operation="edit",
             ),
         )
+        return None
 
     @filter.command("生图模型", alias={"image models"})
     async def image_models(self, event: AstrMessageEvent):
@@ -826,31 +1015,72 @@ class LifeCompanionImagePlugin(Star):
         await self._send_text(event, message)
 
     @filter.command("生活照", alias={"life image", "生活生图"})
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
     async def life_image(self, event: AstrMessageEvent):
+        event.should_call_llm(True)
         try:
             await self._draw(event, self._raw_arg(event, ("生活照", "life image", "生活生图")))
         except Exception as exc:
             logger.error("[LifeCompanionImage] 文生图失败：%s", exc, exc_info=True)
             await self._send_text(event, f"图片生成失败：{self._safe_error(exc)}")
+        finally:
+            event.stop_event()
 
-    @filter.command("生活自拍", alias={"life selfie"})
-    async def life_selfie(self, event: AstrMessageEvent):
+    @filter.command("自拍")
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def selfie_command(self, event: AstrMessageEvent):
+        """Directly execute the explicit /自拍 command without an LLM tool round-trip."""
+        event.should_call_llm(True)
+        started_at = time.perf_counter()
+        prompt = self._raw_arg(event, ("自拍",))
+        logger.info(
+            "[LifeCompanionImage] /自拍 已进入图片插件：提示词=%s",
+            "有" if prompt else "无",
+        )
         try:
-            await self._selfie(event, self._raw_arg(event, ("生活自拍", "life selfie")))
+            await self._selfie(event, prompt, announce=False)
         except Exception as exc:
             logger.error("[LifeCompanionImage] 自拍失败：%s", exc, exc_info=True)
             await self._send_text(event, f"生活自拍失败：{self._safe_error(exc)}")
+        finally:
+            event.stop_event()
+            logger.info(
+                "[LifeCompanionImage] /自拍 命令处理结束：插件处理耗时=%.2fs",
+                time.perf_counter() - started_at,
+            )
+
+    @filter.command("生活自拍", alias={"life selfie"})
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def life_selfie(self, event: AstrMessageEvent):
+        event.should_call_llm(True)
+        try:
+            await self._selfie(
+                event,
+                self._raw_arg(event, ("生活自拍", "life selfie")),
+                announce=False,
+            )
+        except Exception as exc:
+            logger.error("[LifeCompanionImage] 自拍失败：%s", exc, exc_info=True)
+            await self._send_text(event, f"生活自拍失败：{self._safe_error(exc)}")
+        finally:
+            event.stop_event()
 
     @filter.command("生活改图", alias={"life edit"})
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
     async def life_edit(self, event: AstrMessageEvent):
+        event.should_call_llm(True)
         try:
             await self._edit(event, self._raw_arg(event, ("生活改图", "life edit")))
         except Exception as exc:
             logger.error("[LifeCompanionImage] 改图失败：%s", exc, exc_info=True)
             await self._send_text(event, f"图片修改失败：{self._safe_error(exc)}")
+        finally:
+            event.stop_event()
 
     @filter.command("生活参考照", alias={"life reference"})
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
     async def life_reference(self, event: AstrMessageEvent):
+        event.should_call_llm(True)
         arg = self._raw_arg(event, ("生活参考照", "life reference")).lower()
         if arg in {"查看", "show", "看"}:
             count = len(self._configured_reference_paths())
@@ -899,19 +1129,39 @@ class LifeCompanionImagePlugin(Star):
         """Generate a life-context image and send it to the current conversation."""
         raw_prompt = f"{prompt} {size}".strip()
         normalized_mode = str(mode or "auto").strip().lower()
+        operation = "draw"
+        result = None
+        logger.info(
+            "[LifeCompanionImage] LLM工具 life_companion_image 被调用：模式=%s，提示词=%s，尺寸=%s",
+            normalized_mode,
+            "有" if raw_prompt else "无",
+            size or "auto",
+        )
         if normalized_mode in {"selfie", "life_selfie", "selfie_ref"}:
-            await self._selfie(event, raw_prompt)
+            operation = "selfie"
+            result = await self._selfie(event, raw_prompt, notify=False)
         elif normalized_mode in {"edit", "img2img", "aiedit"}:
-            await self._edit(event, raw_prompt)
+            operation = "edit"
+            result = await self._edit(event, raw_prompt, notify=False)
         elif normalized_mode == "auto" and self._is_selfie_request(
             getattr(event, "message_str", "")
         ):
-            await self._selfie(event, raw_prompt)
+            operation = "selfie"
+            result = await self._selfie(event, raw_prompt, notify=False)
         elif normalized_mode == "auto" and await self._event_images(event):
-            await self._edit(event, raw_prompt)
+            operation = "edit"
+            result = await self._edit(event, raw_prompt, notify=False)
         else:
-            await self._draw(event, raw_prompt)
-        return "图片生成任务已执行；如果图片没有出现，请检查插件配置和日志。"
+            result = await self._draw(event, raw_prompt, notify=False)
+        if result:
+            logger.info(
+                "[LifeCompanionImage] LLM工具未提交图片请求：操作=%s，原因=%s",
+                operation,
+                result,
+            )
+            return self._llm_tool_failure_message(operation)
+        logger.info("[LifeCompanionImage] LLM工具已提交图片请求：操作=%s", operation)
+        return "图片请求已提交，图片插件会直接发送承接话和图片；不要向用户复述内部状态。"
 
     @filter.llm_tool(name="aiimg_generate")
     async def aiimg_generate(
@@ -926,34 +1176,61 @@ class LifeCompanionImagePlugin(Star):
         reason: str = "",
     ) -> str:
         """Keep the former Gitee tool name available after plugin replacement."""
-        del backend, resolution
+        del backend
         raw_prompt = str(prompt or "").strip() or str(reason or "").strip()
-        size = next(
-            (
-                str(value).strip()
-                for value in (aspect_ratio, output)
-                if str(value or "").strip().lower() not in {"", "auto"}
-            ),
-            "",
-        )
+        size_tokens: list[str] = []
+        seen_size_tokens: set[str] = set()
+        for value in (aspect_ratio, resolution, output):
+            for token in re.split(r"[\s,/]+", str(value or "").strip()):
+                normalized_token = token.casefold()
+                if normalized_token in {"", "auto"} or normalized_token in seen_size_tokens:
+                    continue
+                seen_size_tokens.add(normalized_token)
+                size_tokens.append(token)
+        size = " ".join(size_tokens)
         if size:
             raw_prompt = f"{raw_prompt} {size}".strip()
 
         normalized_mode = str(mode or "auto").strip().lower()
+        operation = "draw"
+        result = None
+        logger.info(
+            "[LifeCompanionImage] LLM工具 aiimg_generate 被调用：模式=%s，提示词=%s，尺寸=%s",
+            normalized_mode,
+            "有" if raw_prompt else "无",
+            size or "auto",
+        )
         if normalized_mode in {"selfie_ref", "selfie", "ref"}:
-            await self._selfie(event, raw_prompt)
+            operation = "selfie"
+            result = await self._selfie(event, raw_prompt, notify=False)
         elif normalized_mode in {"edit", "img2img", "aiedit"}:
-            await self._edit(event, raw_prompt)
+            operation = "edit"
+            result = await self._edit(event, raw_prompt, notify=False)
         elif normalized_mode == "auto":
-            if self._is_selfie_request(raw_prompt):
-                await self._selfie(event, raw_prompt)
+            if self._is_selfie_request(raw_prompt) or self._is_selfie_request(
+                getattr(event, "message_str", "")
+            ):
+                operation = "selfie"
+                result = await self._selfie(event, raw_prompt, notify=False)
             elif await self._event_images(event):
-                await self._edit(event, raw_prompt)
+                operation = "edit"
+                result = await self._edit(event, raw_prompt, notify=False)
             else:
-                await self._draw(event, raw_prompt)
+                result = await self._draw(event, raw_prompt, notify=False)
         else:
-            await self._draw(event, raw_prompt)
-        return "图片生成任务已执行；如果图片没有出现，请检查插件配置和日志。"
+            result = await self._draw(event, raw_prompt, notify=False)
+        if result:
+            logger.info(
+                "[LifeCompanionImage] LLM工具未提交图片请求：工具=aiimg_generate，操作=%s，原因=%s",
+                operation,
+                result,
+            )
+            return self._llm_tool_failure_message(operation)
+        logger.info(
+            "[LifeCompanionImage] LLM工具已提交图片请求：工具=aiimg_generate，操作=%s",
+            operation,
+        )
+        return "图片请求已提交，图片插件会直接发送承接话和图片；不要向用户复述内部状态。"
 
     @staticmethod
     def _safe_error(exc: Exception) -> str:

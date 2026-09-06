@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+
 from core.gitee_client import GiteeAIClient, GiteeAPIError
 from core.prompting import build_selfie_prompt, normalize_output_size, split_size_suffix
 
@@ -411,3 +413,104 @@ class GiteeClientTest(unittest.IsolatedAsyncioTestCase):
             request["json"]["generationConfig"]["imageConfig"],
             {"imageSize": "4K", "aspectRatio": "16:9"},
         )
+
+    async def test_gemini_edit_preserves_large_reference_bytes_and_output_controls(self):
+        reference = b"\xff\xd8\xff" + bytes(range(256)) * 5000
+        generated = b"\x89PNG\r\ngenerated-image"
+        config = {
+            "features": {
+                "selfie": {
+                    "default_output": "4K",
+                    "chain": [{"provider_id": "meinianda"}],
+                }
+            },
+            "providers": [
+                {
+                    "id": "meinianda",
+                    "__template_key": "gemini_native",
+                    "api_url": "https://example.test",
+                    "api_keys": ["key-a"],
+                    "model": "gemini-test",
+                    "max_retries": 0,
+                }
+            ],
+        }
+        fake = FakeHTTPClient(
+            [
+                FakeResponse(
+                    payload={
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [
+                                        {
+                                            "inlineData": {
+                                                "mimeType": "image/png",
+                                                "data": base64.b64encode(generated).decode(),
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                )
+            ]
+        )
+        client = GiteeAIClient(config, Path(self.tmp.name), http_client=fake)
+
+        await client.edit(
+            "窗边自然生活照",
+            [reference],
+            task_types=["id", "background", "style"],
+            size="16:9 4K",
+            operation="selfie",
+        )
+
+        request = fake.requests[0][2]["json"]
+        self.assertEqual(
+            request["generationConfig"]["imageConfig"],
+            {"imageSize": "4K", "aspectRatio": "16:9"},
+        )
+        inline = request["contents"][0]["parts"][1]["inlineData"]
+        self.assertEqual(inline["mimeType"], "image/jpeg")
+        self.assertEqual(base64.b64decode(inline["data"]), reference)
+
+    async def test_gemini_read_error_is_not_retried_after_request_body_was_sent(self):
+        class ReadErrorClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def post(self, *args, **kwargs):
+                self.calls += 1
+                raise httpx.ReadError("upstream closed")
+
+        fake = ReadErrorClient()
+        config = {
+            "features": {
+                "selfie": {
+                    "default_output": "4K",
+                    "chain": [{"provider_id": "meinianda"}],
+                }
+            },
+            "providers": [
+                {
+                    "id": "meinianda",
+                    "__template_key": "gemini_native",
+                    "api_url": "https://example.test",
+                    "api_keys": ["key-a"],
+                    "model": "gemini-test",
+                    "max_retries": 2,
+                }
+            ],
+        }
+        client = GiteeAIClient(config, Path(self.tmp.name), http_client=fake)
+
+        with self.assertRaisesRegex(GiteeAPIError, "上游在返回响应前关闭连接"):
+            await client.edit(
+                "窗边自然生活照",
+                [b"reference"],
+                operation="selfie",
+            )
+
+        self.assertEqual(fake.calls, 1)
