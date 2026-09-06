@@ -315,6 +315,94 @@ class PluginContextTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("图片请求已提交", result)
         self.assertEqual(event.sent, [])
 
+    async def test_life_tool_auto_detects_follow_up_selfie_from_provider_context(self):
+        plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
+        plugin._draw = AsyncMock(return_value=None)
+        plugin._edit = AsyncMock(return_value=None)
+        plugin._selfie = AsyncMock(return_value=None)
+
+        class _ContextEvent(_SendEvent):
+            def __init__(self):
+                super().__init__()
+                self.message_str = ""
+
+            def get_extra(self, key, default=None):
+                if key == "provider_request":
+                    return types.SimpleNamespace(
+                        prompt="看一下嘛，拜托拜托",
+                        contexts=[
+                            {"role": "assistant", "content": "刚才不是才给你看过了？没空陪你自拍连击。"},
+                        ]
+                    )
+                return default
+
+        event = _ContextEvent()
+
+        result = await plugin.life_companion_image(event)
+
+        plugin._selfie.assert_awaited_once_with(event, "", notify=False)
+        plugin._draw.assert_not_awaited()
+        plugin._edit.assert_not_awaited()
+        self.assertIn("图片请求已提交", result)
+
+    async def test_life_tool_auto_detects_colloquial_single_photo_request(self):
+        plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
+        plugin._draw = AsyncMock(return_value=None)
+        plugin._edit = AsyncMock(return_value=None)
+        plugin._selfie = AsyncMock(return_value=None)
+        event = _SendEvent()
+        event.message_str = "就拍一张，求你了"
+
+        result = await plugin.life_companion_image(event)
+
+        plugin._selfie.assert_awaited_once_with(event, "", notify=False)
+        plugin._draw.assert_not_awaited()
+        plugin._edit.assert_not_awaited()
+        self.assertIn("图片请求已提交", result)
+
+    def test_selfie_request_accepts_colloquial_phrases_without_matching_subjects(self):
+        plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
+
+        for request in ("拍一张", "给我拍一张", "再拍一张", "拍一下", "就拍一张，求你了"):
+            with self.subTest(request=request):
+                self.assertTrue(plugin._is_selfie_request(request))
+
+        self.assertFalse(plugin._is_selfie_request("拍一张猫"))
+
+    def test_auto_selfie_does_not_reuse_old_selfie_context_for_new_draw_prompt(self):
+        plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
+
+        class _ContextEvent:
+            message_str = ""
+
+            def get_extra(self, key, default=None):
+                if key == "provider_request":
+                    return types.SimpleNamespace(
+                        prompt="画一只猫",
+                        contexts=[{"role": "assistant", "content": "刚才陪你自拍过了。"}],
+                    )
+                return default
+
+        self.assertFalse(plugin._auto_selfie_request(_ContextEvent(), ""))
+
+    async def test_empty_draw_prompt_includes_schedule_and_timeline(self):
+        plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
+        plugin.config = {"features": {"draw": {"default_output": "16:9 4K"}}}
+        plugin._life_context = AsyncMock(
+            return_value={
+                "image_prompt": "窗边的自然生活照",
+                "outfit": "浅色针织衫",
+                "schedule": "下午在咖啡馆阅读",
+                "timeline": [{"time": "15:00", "activity": "在咖啡馆阅读"}],
+            }
+        )
+
+        prompt, _, _ = await plugin._prepare_prompt("", operation="draw")
+
+        self.assertIn("窗边的自然生活照", prompt)
+        self.assertIn("今日日程：下午在咖啡馆阅读", prompt)
+        self.assertIn("15:00 在咖啡馆阅读", prompt)
+
     async def test_life_tool_returns_missing_reference_without_sending_internal_message(self):
         plugin = LifeCompanionImagePlugin.__new__(LifeCompanionImagePlugin)
         missing_reference = (

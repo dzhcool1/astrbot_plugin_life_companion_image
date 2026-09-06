@@ -109,6 +109,11 @@ class LifeCompanionImagePlugin(Star):
         "所有": "all",
         "all": "all",
     }
+    _FOLLOW_UP_IMAGE_RE = re.compile(
+        r"^(?:看看?|看(?:一下|下)?|再看(?:一下|下)?|再来一张|来一张)"
+        r"(?:嘛|吧|呗|呀|啊|拜托)*$",
+        re.IGNORECASE,
+    )
 
     def __init__(self, context: Context, config: dict[str, Any]):
         super().__init__(context)
@@ -225,6 +230,7 @@ class LifeCompanionImagePlugin(Star):
                     f"自然真实的今日生活照，穿着：{outfit or '日常穿搭'}；"
                     f"场景和活动：{schedule or '轻松日常'}"
                 )
+            prompt = self._append_life_context(prompt, life_context)
         schedule = str(life_context.get("schedule") or "").strip()
         timeline = life_context.get("timeline")
         timeline_activities = [
@@ -259,11 +265,130 @@ class LifeCompanionImagePlugin(Star):
     def _is_selfie_request(value: Any) -> bool:
         return bool(
             re.search(
-                r"自拍|selfie|看看你|发张你|你的照片",
+                r"自拍|selfie|看看你|发张你|你的照片|拍照|"
+                r"拍(?:一张|张)(?:照片|照)|"
+                r"(?:就|再|给我|先)?拍(?:一张|张|一下)"
+                r"(?:嘛|吧|呗|呀|啊|求你了|求求你了|拜托)*"
+                r"(?=$|[，,。.!！？?\s])|"
+                r"(?:发|来)(?:一张|张)(?:你的?)?(?:照片|照)",
                 str(value or ""),
                 re.IGNORECASE,
             )
         )
+
+    @staticmethod
+    def _context_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if not isinstance(value, list):
+            return ""
+        parts = []
+        for item in value:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+        return " ".join(parts).strip()
+
+    def _conversation_messages(self, event: AstrMessageEvent) -> list[tuple[str, str]]:
+        request = self._event_extra(event, "provider_request")
+        contexts = self._request_value(request, "contexts")
+        if not isinstance(contexts, list):
+            return []
+        messages = []
+        for item in contexts:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            text = self._context_text(item.get("content"))
+            if text:
+                messages.append((role, text))
+        return messages
+
+    @classmethod
+    def _is_follow_up_image_request(cls, value: Any) -> bool:
+        compact = re.sub(r"[\s，,。.!！？?]+", "", str(value or "").strip())
+        return bool(cls._FOLLOW_UP_IMAGE_RE.fullmatch(compact))
+
+    def _auto_selfie_request(
+        self, event: AstrMessageEvent, raw_prompt: str
+    ) -> bool:
+        direct_text = str(raw_prompt or "").strip()
+        if direct_text and self._is_selfie_request(direct_text):
+            return True
+
+        event_text = str(getattr(event, "message_str", "") or "").strip()
+        if event_text and self._is_selfie_request(event_text):
+            return True
+
+        request = self._event_extra(event, "provider_request")
+        provider_prompt = str(
+            self._request_value(request, "prompt", "") or ""
+        ).strip()
+        if provider_prompt and self._is_selfie_request(provider_prompt):
+            return True
+
+        messages = self._conversation_messages(event)
+        latest_user_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index][0] == "user"
+            ),
+            None,
+        )
+        latest_user = (
+            messages[latest_user_index][1]
+            if latest_user_index is not None
+            else ""
+        )
+        current_text = event_text or provider_prompt or latest_user or direct_text
+        if self._is_selfie_request(current_text):
+            return True
+        if not self._is_follow_up_image_request(current_text):
+            return False
+
+        previous_assistant = next(
+            (
+                messages[index][1]
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index][0] == "assistant"
+            ),
+            "",
+        )
+        return self._is_selfie_request(previous_assistant)
+
+    @staticmethod
+    def _append_life_context(prompt: str, life_context: dict[str, Any]) -> str:
+        lines = []
+        outfit = str(life_context.get("outfit") or "").strip()
+        schedule = str(life_context.get("schedule") or "").strip()
+        if outfit:
+            lines.append(f"- 今日穿搭：{outfit}")
+        if schedule:
+            lines.append(f"- 今日日程：{schedule}")
+        timeline = life_context.get("timeline")
+        if isinstance(timeline, list):
+            entries = []
+            for item in timeline[:8]:
+                if not isinstance(item, dict):
+                    continue
+                time_value = str(item.get("time") or "").strip()
+                activity = str(
+                    item.get("activity") or item.get("title") or item.get("text") or ""
+                ).strip()
+                if activity:
+                    entries.append(f"{time_value} {activity[:120]}".strip())
+            if entries:
+                lines.extend(["- 今日时间线：", *entries])
+        if not lines:
+            return prompt
+        return (
+            f"{prompt}\n\n今日生活状态（用户没有指定其它场景时请遵循）：\n"
+            + "\n".join(lines)
+        ).strip()
 
     @staticmethod
     def _decode_image_data(value: str | bytes) -> bytes:
@@ -1143,9 +1268,7 @@ class LifeCompanionImagePlugin(Star):
         elif normalized_mode in {"edit", "img2img", "aiedit"}:
             operation = "edit"
             result = await self._edit(event, raw_prompt, notify=False)
-        elif normalized_mode == "auto" and self._is_selfie_request(
-            getattr(event, "message_str", "")
-        ):
+        elif normalized_mode == "auto" and self._auto_selfie_request(event, raw_prompt):
             operation = "selfie"
             result = await self._selfie(event, raw_prompt, notify=False)
         elif normalized_mode == "auto" and await self._event_images(event):
@@ -1207,9 +1330,7 @@ class LifeCompanionImagePlugin(Star):
             operation = "edit"
             result = await self._edit(event, raw_prompt, notify=False)
         elif normalized_mode == "auto":
-            if self._is_selfie_request(raw_prompt) or self._is_selfie_request(
-                getattr(event, "message_str", "")
-            ):
+            if self._auto_selfie_request(event, raw_prompt):
                 operation = "selfie"
                 result = await self._selfie(event, raw_prompt, notify=False)
             elif await self._event_images(event):
